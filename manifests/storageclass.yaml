@@ -4,7 +4,8 @@ metadata:
   name: nfs-loop
 provisioner: nfs-loop.csi.kinorca.com
 parameters:
-  fsType: ext4
+  fsType: ext
+  url: nfs://127.0.0.1/share
 reclaimPolicy: Delete
 allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer

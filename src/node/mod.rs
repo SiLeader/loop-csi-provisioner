@@ -1,3 +1,7 @@
+mod error;
+mod operator;
+
+use crate::node::operator::NodeOperator;
 use crate::proto::csi::v1::node_server::Node;
 use crate::proto::csi::v1::{
     NodeExpandVolumeRequest, NodeExpandVolumeResponse, NodeGetCapabilitiesRequest,
@@ -8,12 +12,16 @@ use crate::proto::csi::v1::{
     NodeStageVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
     NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
 };
-use std::path::PathBuf;
-use tokio::process::Command;
 use tonic::{Request, Response, Status, async_trait};
 
-pub struct LoopCsiNode {
-    base_directory: PathBuf,
+pub(crate) struct LoopCsiNode {
+    operator: NodeOperator,
+}
+
+impl LoopCsiNode {
+    pub fn new(operator: NodeOperator) -> Self {
+        Self { operator }
+    }
 }
 
 #[async_trait]
@@ -23,53 +31,10 @@ impl Node for LoopCsiNode {
         request: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
         let request = request.into_inner();
-        let file_name = format!("{}.img", request.volume_id);
-        let res = Command::new("losetup")
-            .args([
-                "--find",
-                "--show",
-                &self.base_directory.join(&file_name).to_string_lossy(),
-            ])
-            .output()
-            .await?;
-        if !res.status.success() {
-            return Err(Status::internal(format!(
-                "losetup failed: {}",
-                String::from_utf8_lossy(&res.stderr)
-            )));
-        }
-        let loop_device = String::from_utf8_lossy(&res.stdout).trim().to_string();
 
-        let res = Command::new("blkid").args([&loop_device]).output().await?;
-        if !res.status.success() {
-            return Err(Status::internal(format!(
-                "blkid failed: {}",
-                String::from_utf8_lossy(&res.stderr)
-            )));
-        }
-        if res.stdout.is_empty() {
-            let res = Command::new("mkfs.ext4")
-                .args(["-F", &loop_device])
-                .output()
-                .await?;
-            if !res.status.success() {
-                return Err(Status::internal(format!(
-                    "mkfs.ext4 failed: {}",
-                    String::from_utf8_lossy(&res.stderr)
-                )));
-            }
-        }
-
-        let res = Command::new("mount")
-            .args([&loop_device, &request.staging_target_path])
-            .output()
+        self.operator
+            .stage_volume(&request.volume_id, &request.staging_target_path)
             .await?;
-        if !res.status.success() {
-            return Err(Status::internal(format!(
-                "mount failed: {}",
-                String::from_utf8_lossy(&res.stderr)
-            )));
-        }
 
         Ok(Response::new(NodeStageVolumeResponse {}))
     }
@@ -87,16 +52,9 @@ impl Node for LoopCsiNode {
     ) -> Result<Response<NodePublishVolumeResponse>, Status> {
         let request = request.into_inner();
 
-        let res = Command::new("mount")
-            .args([&request.staging_target_path, &request.target_path])
-            .output()
+        self.operator
+            .publish_volume(&request.staging_target_path, &request.target_path)
             .await?;
-        if !res.status.success() {
-            return Err(Status::internal(format!(
-                "mount failed: {}",
-                String::from_utf8_lossy(&res.stderr)
-            )));
-        }
         Ok(Response::new(NodePublishVolumeResponse {}))
     }
 
@@ -134,9 +92,13 @@ impl Node for LoopCsiNode {
 
     async fn node_expand_volume(
         &self,
-        _request: Request<NodeExpandVolumeRequest>,
+        request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
-        Err(Status::unavailable("NodeExpandVolume is not implemented"))
+        let request = request.into_inner();
+
+        let capacity_bytes = self.operator.expand_volume(&request.volume_id).await?;
+
+        Ok(Response::new(NodeExpandVolumeResponse { capacity_bytes }))
     }
 
     async fn node_get_capabilities(

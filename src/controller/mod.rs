@@ -1,3 +1,8 @@
+mod error;
+mod operator;
+
+use crate::controller::operator::ControllerOperator;
+use crate::mount::MountManager;
 use crate::proto::csi::v1::controller_server::Controller;
 use crate::proto::csi::v1::{
     ControllerExpandVolumeRequest, ControllerExpandVolumeResponse,
@@ -14,22 +19,17 @@ use crate::proto::csi::v1::{
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
     ValidateVolumeCapabilitiesResponse, Volume,
 };
-use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::collections::HashMap;
 use tonic::{Request, Response, Status, async_trait};
 
-pub struct LoopCsiController {
-    default_size: i64,
-    storage_base_directory: PathBuf,
-    metadata_base_directory: PathBuf,
+pub(crate) struct LoopCsiController {
+    operator: ControllerOperator,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Metadata {
-    volume_id: String,
-    attached_node: String,
+impl LoopCsiController {
+    pub fn new(operator: ControllerOperator) -> Self {
+        Self { operator }
+    }
 }
 
 #[async_trait]
@@ -39,23 +39,23 @@ impl Controller for LoopCsiController {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let request = request.into_inner();
-        let size = request
-            .capacity_range
-            .as_ref()
-            .map(|c| c.required_bytes)
-            .unwrap_or(self.default_size);
-
-        let file_name = format!("{}.img", request.name);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&self.storage_base_directory.join(&file_name))?;
-        file.set_len(size as u64)?;
+        let Some(url) = request.parameters.get("url").cloned() else {
+            return Err(Status::invalid_argument("Missing 'url' parameter"));
+        };
+        let capacity_bytes = self
+            .operator
+            .create_volume(
+                &request.name,
+                request.capacity_range.as_ref().map(|c| c.required_bytes),
+                &url,
+            )
+            .await?;
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
-                volume_id: file_name,
-                capacity_bytes: size,
+                volume_id: format!("{}:{}", url, request.name),
+                capacity_bytes,
+                volume_context: HashMap::from([("url".to_string(), url)]),
                 ..Default::default()
             }),
         }))
@@ -65,7 +65,10 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
-        todo!()
+        let request = request.into_inner();
+        self.operator.delete_volume(&request.volume_id).await?;
+
+        Ok(Response::new(DeleteVolumeResponse {}))
     }
 
     async fn controller_publish_volume(
@@ -73,58 +76,10 @@ impl Controller for LoopCsiController {
         request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
         let request = request.into_inner();
-        let metadata_file_name = format!("{}.json", request.volume_id);
-        let metadata_file_path = self.metadata_base_directory.join(&metadata_file_name);
-        let metadata: Option<Metadata> = {
-            let file = match File::open(&metadata_file_path) {
-                Ok(f) => Some(f),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    return Err(Status::not_found(format!(
-                        "Metadata file {} not found: {}",
-                        metadata_file_path.display(),
-                        e
-                    )));
-                }
-            };
-            match file {
-                Some(f) => Some(serde_json::from_reader(f).map_err(|e| {
-                    Status::internal(format!(
-                        "Failed to parse metadata file {}: {}",
-                        metadata_file_path.display(),
-                        e
-                    ))
-                })?),
-                None => None,
-            }
-        };
-        if let Some(metadata) = metadata {
-            if metadata.attached_node != request.node_id {
-                return Err(Status::failed_precondition(format!(
-                    "Volume {} is attached to node {}, cannot attach to node {}",
-                    request.volume_id, metadata.attached_node, request.node_id
-                )));
-            }
-        } else {
-            let metadata = Metadata {
-                volume_id: request.volume_id.clone(),
-                attached_node: request.node_id.clone(),
-            };
-            let metadata_file = File::create(&metadata_file_path).map_err(|e| {
-                Status::internal(format!(
-                    "Failed to create metadata file {}: {}",
-                    metadata_file_path.display(),
-                    e
-                ))
-            })?;
-            serde_json::to_writer(metadata_file, &metadata).map_err(|e| {
-                Status::internal(format!(
-                    "Failed to write metadata file {}: {}",
-                    metadata_file_path.display(),
-                    e
-                ))
-            })?;
-        }
+        request.volume_context;
+        self.operator
+            .publish_volume(&request.volume_id, &request.node_id)
+            .await?;
 
         Ok(Response::new(ControllerPublishVolumeResponse {
             publish_context: Default::default(),
@@ -135,6 +90,7 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<ControllerUnpublishVolumeRequest>,
     ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
+        let request = request.into_inner();
         todo!()
     }
 
@@ -214,11 +170,18 @@ impl Controller for LoopCsiController {
 
     async fn controller_expand_volume(
         &self,
-        _request: Request<ControllerExpandVolumeRequest>,
+        request: Request<ControllerExpandVolumeRequest>,
     ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
-        Err(Status::unavailable(
-            "ControllerExpandVolume is not implemented",
-        ))
+        let request = request.into_inner();
+        let size = request.capacity_range.as_ref().map(|c| c.required_bytes);
+        let capacity_bytes = self
+            .operator
+            .expand_volume(&request.volume_id, size)
+            .await?;
+        Ok(Response::new(ControllerExpandVolumeResponse {
+            capacity_bytes,
+            node_expansion_required: true,
+        }))
     }
 
     async fn controller_get_volume(

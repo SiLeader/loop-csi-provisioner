@@ -4,8 +4,10 @@ use tracing_subscriber::EnvFilter;
 
 mod controller;
 mod identity;
+mod mount;
 mod node;
 mod proto;
+mod volume_id;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
