@@ -8,17 +8,70 @@ use crate::proto::csi::v1::{
     NodeStageVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
     NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
 };
+use std::path::PathBuf;
+use tokio::process::Command;
 use tonic::{Request, Response, Status, async_trait};
 
-pub struct NfsLoopCsiNode {}
+pub struct LoopCsiNode {
+    base_directory: PathBuf,
+}
 
 #[async_trait]
-impl Node for NfsLoopCsiNode {
+impl Node for LoopCsiNode {
     async fn node_stage_volume(
         &self,
         request: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
-        todo!()
+        let request = request.into_inner();
+        let file_name = format!("{}.img", request.volume_id);
+        let res = Command::new("losetup")
+            .args([
+                "--find",
+                "--show",
+                &self.base_directory.join(&file_name).to_string_lossy(),
+            ])
+            .output()
+            .await?;
+        if !res.status.success() {
+            return Err(Status::internal(format!(
+                "losetup failed: {}",
+                String::from_utf8_lossy(&res.stderr)
+            )));
+        }
+        let loop_device = String::from_utf8_lossy(&res.stdout).trim().to_string();
+
+        let res = Command::new("blkid").args([&loop_device]).output().await?;
+        if !res.status.success() {
+            return Err(Status::internal(format!(
+                "blkid failed: {}",
+                String::from_utf8_lossy(&res.stderr)
+            )));
+        }
+        if res.stdout.is_empty() {
+            let res = Command::new("mkfs.ext4")
+                .args(["-F", &loop_device])
+                .output()
+                .await?;
+            if !res.status.success() {
+                return Err(Status::internal(format!(
+                    "mkfs.ext4 failed: {}",
+                    String::from_utf8_lossy(&res.stderr)
+                )));
+            }
+        }
+
+        let res = Command::new("mount")
+            .args([&loop_device, &request.staging_target_path])
+            .output()
+            .await?;
+        if !res.status.success() {
+            return Err(Status::internal(format!(
+                "mount failed: {}",
+                String::from_utf8_lossy(&res.stderr)
+            )));
+        }
+
+        Ok(Response::new(NodeStageVolumeResponse {}))
     }
 
     async fn node_unstage_volume(
@@ -32,7 +85,19 @@ impl Node for NfsLoopCsiNode {
         &self,
         request: Request<NodePublishVolumeRequest>,
     ) -> Result<Response<NodePublishVolumeResponse>, Status> {
-        todo!()
+        let request = request.into_inner();
+
+        let res = Command::new("mount")
+            .args([&request.staging_target_path, &request.target_path])
+            .output()
+            .await?;
+        if !res.status.success() {
+            return Err(Status::internal(format!(
+                "mount failed: {}",
+                String::from_utf8_lossy(&res.stderr)
+            )));
+        }
+        Ok(Response::new(NodePublishVolumeResponse {}))
     }
 
     async fn node_unpublish_volume(
@@ -44,30 +109,34 @@ impl Node for NfsLoopCsiNode {
 
     async fn node_get_volume_stats(
         &self,
-        request: Request<NodeGetVolumeStatsRequest>,
+        _request: Request<NodeGetVolumeStatsRequest>,
     ) -> Result<Response<NodeGetVolumeStatsResponse>, Status> {
-        todo!()
+        Err(Status::unavailable("NodeGetVolumeStats is not implemented"))
     }
 
     async fn node_get_volume_health(
         &self,
-        request: Request<NodeGetVolumeHealthRequest>,
+        _request: Request<NodeGetVolumeHealthRequest>,
     ) -> Result<Response<NodeGetVolumeHealthResponse>, Status> {
-        todo!()
+        Err(Status::unavailable(
+            "NodeGetVolumeHealth is not implemented",
+        ))
     }
 
     async fn node_get_storage_health(
         &self,
-        request: Request<NodeGetStorageHealthRequest>,
+        _request: Request<NodeGetStorageHealthRequest>,
     ) -> Result<Response<NodeGetStorageHealthResponse>, Status> {
-        todo!()
+        Err(Status::unavailable(
+            "NodeGetStorageHealth is not implemented",
+        ))
     }
 
     async fn node_expand_volume(
         &self,
-        request: Request<NodeExpandVolumeRequest>,
+        _request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
-        todo!()
+        Err(Status::unavailable("NodeExpandVolume is not implemented"))
     }
 
     async fn node_get_capabilities(

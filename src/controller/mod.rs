@@ -12,19 +12,28 @@ use crate::proto::csi::v1::{
     DeleteVolumeRequest, DeleteVolumeResponse, GetCapacityRequest, GetCapacityResponse,
     GetSnapshotRequest, GetSnapshotResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
-    ValidateVolumeCapabilitiesResponse,
+    ValidateVolumeCapabilitiesResponse, Volume,
 };
-use std::fs::OpenOptions;
+use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use tonic::{Request, Response, Status, async_trait};
 
-pub struct NfsLoopCsiController {
+pub struct LoopCsiController {
     default_size: i64,
-    base_directory: PathBuf,
+    storage_base_directory: PathBuf,
+    metadata_base_directory: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Metadata {
+    volume_id: String,
+    attached_node: String,
 }
 
 #[async_trait]
-impl Controller for NfsLoopCsiController {
+impl Controller for LoopCsiController {
     async fn create_volume(
         &self,
         request: Request<CreateVolumeRequest>,
@@ -36,12 +45,20 @@ impl Controller for NfsLoopCsiController {
             .map(|c| c.required_bytes)
             .unwrap_or(self.default_size);
 
+        let file_name = format!("{}.img", request.name);
         let file = OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&self.base_directory.join(&request.name))?;
+            .open(&self.storage_base_directory.join(&file_name))?;
         file.set_len(size as u64)?;
-        todo!()
+
+        Ok(Response::new(CreateVolumeResponse {
+            volume: Some(Volume {
+                volume_id: file_name,
+                capacity_bytes: size,
+                ..Default::default()
+            }),
+        }))
     }
 
     async fn delete_volume(
@@ -55,7 +72,63 @@ impl Controller for NfsLoopCsiController {
         &self,
         request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
-        todo!()
+        let request = request.into_inner();
+        let metadata_file_name = format!("{}.json", request.volume_id);
+        let metadata_file_path = self.metadata_base_directory.join(&metadata_file_name);
+        let metadata: Option<Metadata> = {
+            let file = match File::open(&metadata_file_path) {
+                Ok(f) => Some(f),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(Status::not_found(format!(
+                        "Metadata file {} not found: {}",
+                        metadata_file_path.display(),
+                        e
+                    )));
+                }
+            };
+            match file {
+                Some(f) => Some(serde_json::from_reader(f).map_err(|e| {
+                    Status::internal(format!(
+                        "Failed to parse metadata file {}: {}",
+                        metadata_file_path.display(),
+                        e
+                    ))
+                })?),
+                None => None,
+            }
+        };
+        if let Some(metadata) = metadata {
+            if metadata.attached_node != request.node_id {
+                return Err(Status::failed_precondition(format!(
+                    "Volume {} is attached to node {}, cannot attach to node {}",
+                    request.volume_id, metadata.attached_node, request.node_id
+                )));
+            }
+        } else {
+            let metadata = Metadata {
+                volume_id: request.volume_id.clone(),
+                attached_node: request.node_id.clone(),
+            };
+            let metadata_file = File::create(&metadata_file_path).map_err(|e| {
+                Status::internal(format!(
+                    "Failed to create metadata file {}: {}",
+                    metadata_file_path.display(),
+                    e
+                ))
+            })?;
+            serde_json::to_writer(metadata_file, &metadata).map_err(|e| {
+                Status::internal(format!(
+                    "Failed to write metadata file {}: {}",
+                    metadata_file_path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        Ok(Response::new(ControllerPublishVolumeResponse {
+            publish_context: Default::default(),
+        }))
     }
 
     async fn controller_unpublish_volume(
@@ -74,30 +147,34 @@ impl Controller for NfsLoopCsiController {
 
     async fn list_volumes(
         &self,
-        request: Request<ListVolumesRequest>,
+        _request: Request<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
-        todo!()
+        Err(Status::unavailable("ListVolumes is not implemented"))
     }
 
     async fn controller_list_volume_health(
         &self,
-        request: Request<ControllerListVolumeHealthRequest>,
+        _request: Request<ControllerListVolumeHealthRequest>,
     ) -> Result<Response<ControllerListVolumeHealthResponse>, Status> {
-        todo!()
+        Err(Status::unavailable(
+            "ControllerListVolumeHealth is not implemented",
+        ))
     }
 
     async fn controller_get_volume_health(
         &self,
-        request: Request<ControllerGetVolumeHealthRequest>,
+        _request: Request<ControllerGetVolumeHealthRequest>,
     ) -> Result<Response<ControllerGetVolumeHealthResponse>, Status> {
-        todo!()
+        Err(Status::unavailable(
+            "ControllerGetVolumeHealth is not implemented",
+        ))
     }
 
     async fn get_capacity(
         &self,
-        request: Request<GetCapacityRequest>,
+        _request: Request<GetCapacityRequest>,
     ) -> Result<Response<GetCapacityResponse>, Status> {
-        todo!()
+        Err(Status::unavailable("GetCapacity is not implemented"))
     }
 
     async fn controller_get_capabilities(
@@ -109,50 +186,56 @@ impl Controller for NfsLoopCsiController {
 
     async fn create_snapshot(
         &self,
-        request: Request<CreateSnapshotRequest>,
+        _request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        todo!()
+        Err(Status::unavailable("CreateSnapshot is not implemented"))
     }
 
     async fn delete_snapshot(
         &self,
-        request: Request<DeleteSnapshotRequest>,
+        _request: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
-        todo!()
+        Err(Status::unavailable("DeleteSnapshot is not implemented"))
     }
 
     async fn list_snapshots(
         &self,
-        request: Request<ListSnapshotsRequest>,
+        _request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
-        todo!()
+        Err(Status::unavailable("ListSnapshots is not implemented"))
     }
 
     async fn get_snapshot(
         &self,
-        request: Request<GetSnapshotRequest>,
+        _request: Request<GetSnapshotRequest>,
     ) -> Result<Response<GetSnapshotResponse>, Status> {
-        todo!()
+        Err(Status::unavailable("GetSnapshot is not implemented"))
     }
 
     async fn controller_expand_volume(
         &self,
-        request: Request<ControllerExpandVolumeRequest>,
+        _request: Request<ControllerExpandVolumeRequest>,
     ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
-        todo!()
+        Err(Status::unavailable(
+            "ControllerExpandVolume is not implemented",
+        ))
     }
 
     async fn controller_get_volume(
         &self,
-        request: Request<ControllerGetVolumeRequest>,
+        _request: Request<ControllerGetVolumeRequest>,
     ) -> Result<Response<ControllerGetVolumeResponse>, Status> {
-        todo!()
+        Err(Status::unavailable(
+            "ControllerGetVolume is not implemented",
+        ))
     }
 
     async fn controller_modify_volume(
         &self,
-        request: Request<ControllerModifyVolumeRequest>,
+        _request: Request<ControllerModifyVolumeRequest>,
     ) -> Result<Response<ControllerModifyVolumeResponse>, Status> {
-        todo!()
+        Err(Status::unavailable(
+            "ControllerModifyVolume is not implemented",
+        ))
     }
 }

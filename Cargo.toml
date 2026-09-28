@@ -1,13 +1,24 @@
 [package]
-name = "nfs-loop-csi"
+name = "loop-csi-provisioner"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "process"] }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 prost = "0.14.4"
 prost-types = "0.14.4"
+
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+clap = { version = "4.6.7", features = ["derive"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
