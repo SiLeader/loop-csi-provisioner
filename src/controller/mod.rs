@@ -10,14 +10,15 @@ use crate::proto::csi::v1::{
     ControllerGetVolumeRequest, ControllerGetVolumeResponse, ControllerListVolumeHealthRequest,
     ControllerListVolumeHealthResponse, ControllerModifyVolumeRequest,
     ControllerModifyVolumeResponse, ControllerPublishVolumeRequest,
-    ControllerPublishVolumeResponse, ControllerUnpublishVolumeRequest,
+    ControllerPublishVolumeResponse, ControllerServiceCapability, ControllerUnpublishVolumeRequest,
     ControllerUnpublishVolumeResponse, CreateSnapshotRequest, CreateSnapshotResponse,
     CreateVolumeRequest, CreateVolumeResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
     DeleteVolumeRequest, DeleteVolumeResponse, GetCapacityRequest, GetCapacityResponse,
     GetSnapshotRequest, GetSnapshotResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
-    ValidateVolumeCapabilitiesResponse, Volume,
+    ValidateVolumeCapabilitiesResponse, Volume, VolumeCapability, controller_service_capability,
 };
+use crate::volume_id::valid_volume_name;
 use std::collections::HashMap;
 use tonic::{Request, Response, Status, async_trait};
 
@@ -31,6 +32,19 @@ impl LoopCsiController {
     }
 }
 
+fn supported_capability(capability: &VolumeCapability) -> bool {
+    use crate::proto::csi::v1::volume_capability::{AccessType, access_mode::Mode};
+    let mount_ok = matches!(&capability.access_type, Some(AccessType::Mount(mount))
+        if (mount.fs_type.is_empty() || mount.fs_type == "ext4") && mount.mount_flags.is_empty() && mount.volume_mount_group.is_empty());
+    let mode_ok = capability.access_mode.as_ref().is_some_and(|mode| {
+        matches!(
+            Mode::try_from(mode.mode),
+            Ok(Mode::SingleNodeWriter | Mode::SingleNodeReaderOnly)
+        )
+    });
+    mount_ok && mode_ok
+}
+
 #[async_trait]
 impl Controller for LoopCsiController {
     async fn create_volume(
@@ -41,18 +55,52 @@ impl Controller for LoopCsiController {
         let Some(url) = request.parameters.get("url").cloned() else {
             return Err(Status::invalid_argument("Missing 'url' parameter"));
         };
+        if !valid_volume_name(&request.name) {
+            return Err(Status::invalid_argument("Invalid volume name"));
+        }
+        if request.volume_capabilities.is_empty()
+            || !request.volume_capabilities.iter().all(supported_capability)
+        {
+            return Err(Status::invalid_argument(
+                "Only ext4 mount volumes with single-node access are supported",
+            ));
+        }
+        if let Some(range) = &request.capacity_range {
+            if range.required_bytes < 0
+                || range.limit_bytes < 0
+                || (range.limit_bytes > 0 && range.required_bytes > range.limit_bytes)
+            {
+                return Err(Status::invalid_argument("Invalid capacity range"));
+            }
+            if range.limit_bytes > 0
+                && range.required_bytes == 0
+                && self.operator.default_size() > range.limit_bytes
+            {
+                return Err(Status::out_of_range(
+                    "Default volume size exceeds capacity limit",
+                ));
+            }
+        }
+        let volume_id = format!("{}:{}", url, request.name);
         let capacity_bytes = self
             .operator
             .create_volume(
-                &request.name,
+                &volume_id,
                 request.capacity_range.as_ref().map(|c| c.required_bytes),
                 &url,
             )
             .await?;
+        if request
+            .capacity_range
+            .as_ref()
+            .is_some_and(|range| range.limit_bytes > 0 && capacity_bytes > range.limit_bytes)
+        {
+            return Err(Status::out_of_range("Volume exceeds capacity limit"));
+        }
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
-                volume_id: format!("{}:{}", url, request.name),
+                volume_id,
                 capacity_bytes,
                 volume_context: HashMap::from([("url".to_string(), url)]),
                 ..Default::default()
@@ -75,7 +123,9 @@ impl Controller for LoopCsiController {
         request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
         let request = request.into_inner();
-        request.volume_context;
+        if request.node_id.is_empty() {
+            return Err(Status::invalid_argument("Missing node ID"));
+        }
         self.operator
             .publish_volume(&request.volume_id, &request.node_id)
             .await?;
@@ -90,28 +140,51 @@ impl Controller for LoopCsiController {
         request: Request<ControllerUnpublishVolumeRequest>,
     ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
         let request = request.into_inner();
-        todo!()
+        self.operator
+            .unpublish_volume(&request.volume_id, &request.node_id)
+            .await?;
+        Ok(Response::new(ControllerUnpublishVolumeResponse {}))
     }
 
     async fn validate_volume_capabilities(
         &self,
         request: Request<ValidateVolumeCapabilitiesRequest>,
     ) -> Result<Response<ValidateVolumeCapabilitiesResponse>, Status> {
-        todo!()
+        let request = request.into_inner();
+        self.operator.volume_size(&request.volume_id).await?;
+        if request.volume_capabilities.is_empty() {
+            return Err(Status::invalid_argument("Missing volume capabilities"));
+        }
+        let confirmed = request
+            .volume_capabilities
+            .iter()
+            .all(supported_capability)
+            .then_some(
+                crate::proto::csi::v1::validate_volume_capabilities_response::Confirmed {
+                    volume_context: request.volume_context,
+                    volume_capabilities: request.volume_capabilities,
+                    parameters: request.parameters,
+                    mutable_parameters: request.mutable_parameters,
+                },
+            );
+        Ok(Response::new(ValidateVolumeCapabilitiesResponse {
+            confirmed,
+            message: String::new(),
+        }))
     }
 
     async fn list_volumes(
         &self,
         _request: Request<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
-        Err(Status::unavailable("ListVolumes is not implemented"))
+        Err(Status::unimplemented("ListVolumes is not implemented"))
     }
 
     async fn controller_list_volume_health(
         &self,
         _request: Request<ControllerListVolumeHealthRequest>,
     ) -> Result<Response<ControllerListVolumeHealthResponse>, Status> {
-        Err(Status::unavailable(
+        Err(Status::unimplemented(
             "ControllerListVolumeHealth is not implemented",
         ))
     }
@@ -120,7 +193,7 @@ impl Controller for LoopCsiController {
         &self,
         _request: Request<ControllerGetVolumeHealthRequest>,
     ) -> Result<Response<ControllerGetVolumeHealthResponse>, Status> {
-        Err(Status::unavailable(
+        Err(Status::unimplemented(
             "ControllerGetVolumeHealth is not implemented",
         ))
     }
@@ -129,42 +202,58 @@ impl Controller for LoopCsiController {
         &self,
         _request: Request<GetCapacityRequest>,
     ) -> Result<Response<GetCapacityResponse>, Status> {
-        Err(Status::unavailable("GetCapacity is not implemented"))
+        Err(Status::unimplemented("GetCapacity is not implemented"))
     }
 
     async fn controller_get_capabilities(
         &self,
-        request: Request<ControllerGetCapabilitiesRequest>,
+        _request: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
-        todo!()
+        use controller_service_capability::rpc::Type;
+        Ok(Response::new(ControllerGetCapabilitiesResponse {
+            capabilities: [
+                Type::CreateDeleteVolume,
+                Type::PublishUnpublishVolume,
+                Type::ExpandVolume,
+            ]
+            .into_iter()
+            .map(|kind| ControllerServiceCapability {
+                r#type: Some(controller_service_capability::Type::Rpc(
+                    controller_service_capability::Rpc {
+                        r#type: kind as i32,
+                    },
+                )),
+            })
+            .collect(),
+        }))
     }
 
     async fn create_snapshot(
         &self,
         _request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
-        Err(Status::unavailable("CreateSnapshot is not implemented"))
+        Err(Status::unimplemented("CreateSnapshot is not implemented"))
     }
 
     async fn delete_snapshot(
         &self,
         _request: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
-        Err(Status::unavailable("DeleteSnapshot is not implemented"))
+        Err(Status::unimplemented("DeleteSnapshot is not implemented"))
     }
 
     async fn list_snapshots(
         &self,
         _request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
-        Err(Status::unavailable("ListSnapshots is not implemented"))
+        Err(Status::unimplemented("ListSnapshots is not implemented"))
     }
 
     async fn get_snapshot(
         &self,
         _request: Request<GetSnapshotRequest>,
     ) -> Result<Response<GetSnapshotResponse>, Status> {
-        Err(Status::unavailable("GetSnapshot is not implemented"))
+        Err(Status::unimplemented("GetSnapshot is not implemented"))
     }
 
     async fn controller_expand_volume(
@@ -173,6 +262,22 @@ impl Controller for LoopCsiController {
     ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
         let request = request.into_inner();
         let size = request.capacity_range.as_ref().map(|c| c.required_bytes);
+        if request.capacity_range.as_ref().is_some_and(|range| {
+            range.required_bytes < 0
+                || range.limit_bytes < 0
+                || (range.limit_bytes > 0 && range.required_bytes > range.limit_bytes)
+        }) {
+            return Err(Status::invalid_argument("Invalid capacity range"));
+        }
+        if request.capacity_range.as_ref().is_some_and(|range| {
+            range.limit_bytes > 0
+                && range.required_bytes == 0
+                && self.operator.default_size() > range.limit_bytes
+        }) {
+            return Err(Status::out_of_range(
+                "Default volume size exceeds capacity limit",
+            ));
+        }
         let capacity_bytes = self
             .operator
             .expand_volume(&request.volume_id, size)
@@ -187,7 +292,7 @@ impl Controller for LoopCsiController {
         &self,
         _request: Request<ControllerGetVolumeRequest>,
     ) -> Result<Response<ControllerGetVolumeResponse>, Status> {
-        Err(Status::unavailable(
+        Err(Status::unimplemented(
             "ControllerGetVolume is not implemented",
         ))
     }
@@ -196,7 +301,7 @@ impl Controller for LoopCsiController {
         &self,
         _request: Request<ControllerModifyVolumeRequest>,
     ) -> Result<Response<ControllerModifyVolumeResponse>, Status> {
-        Err(Status::unavailable(
+        Err(Status::unimplemented(
             "ControllerModifyVolume is not implemented",
         ))
     }

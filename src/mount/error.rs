@@ -18,6 +18,9 @@ pub(crate) enum MountError {
     #[error("Unsupported protocol: {0}")]
     UnsupportedProtocol(String),
 
+    #[error("Invalid local storage path: {0}")]
+    InvalidFilePath(String),
+
     #[error("Command failed with code {code}: {message}")]
     CommandFailure { code: i32, message: String },
 }

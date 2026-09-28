@@ -16,7 +16,6 @@ pub(crate) trait Mounter: Send + Sync {
     fn mount_point(&self, source: &Uri, base: &str) -> Result<String, MountError>;
 
     async fn mount(&self, source: &Uri, mount_point: &str) -> Result<(), MountError>;
-    async fn unmount(&self, mount_point: &str) -> Result<(), MountError>;
 }
 
 pub(crate) struct MountManager {
@@ -43,32 +42,29 @@ impl MountManager {
     }
 
     pub async fn mount(&self, url: &str, base: &str) -> Result<String, MountError> {
-        let uri = Uri::from_str(url)?;
+        let normalized = if let Some(path) = url.strip_prefix("file:///") {
+            format!("file://localhost/{path}")
+        } else if url.starts_with("file://") {
+            return Err(MountError::InvalidFilePath(url.to_string()));
+        } else {
+            url.to_string()
+        };
+        let uri = Uri::from_str(&normalized)?;
         let Some(scheme) = uri.scheme_str() else {
             return Err(MountError::SchemaIsMissing);
         };
         if let Some(mounter) = self.mounters.get(scheme) {
             let mount_point = mounter.mount_point(&uri, base)?;
+            if scheme == "file" {
+                mounter.mount(&uri, &mount_point).await?;
+                return Ok(mount_point);
+            }
             tokio::fs::create_dir_all(&mount_point).await?;
-
             if self.check_mount_point(&mount_point).await? {
                 return Ok(mount_point);
             }
             mounter.mount(&uri, &mount_point).await?;
             Ok(mount_point)
-        } else {
-            Err(MountError::UnsupportedProtocol(scheme.to_string()))
-        }
-    }
-
-    pub async fn unmount(&self, url: &str, base: &str) -> Result<(), MountError> {
-        let uri = Uri::from_str(url)?;
-        let Some(scheme) = uri.scheme_str() else {
-            return Err(MountError::SchemaIsMissing);
-        };
-        if let Some(mounter) = self.mounters.get(scheme) {
-            let mount_point = mounter.mount_point(&uri, base)?;
-            mounter.unmount(&mount_point).await
         } else {
             Err(MountError::UnsupportedProtocol(scheme.to_string()))
         }

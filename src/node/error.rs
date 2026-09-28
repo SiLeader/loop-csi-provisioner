@@ -13,6 +13,9 @@ pub(crate) enum NodeError {
 
     #[error("Failed to parse volume ID")]
     VolumeIdParse,
+
+    #[error("Only ext4 filesystems are supported")]
+    UnsupportedFilesystem,
 }
 
 impl From<Output> for NodeError {
@@ -33,6 +36,9 @@ impl From<NodeError> for tonic::Status {
             NodeError::Mount(e) => tonic::Status::internal(format!("Mount error: {}", e)),
             NodeError::VolumeIdParse => {
                 tonic::Status::invalid_argument("Failed to parse volume ID")
+            }
+            NodeError::UnsupportedFilesystem => {
+                tonic::Status::failed_precondition("Only ext4 filesystems are supported")
             }
         }
     }

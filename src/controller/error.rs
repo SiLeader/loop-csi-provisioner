@@ -29,6 +29,9 @@ pub(crate) enum ControllerError {
 
     #[error("Failed to parse volume ID")]
     VolumeIdParse,
+
+    #[error("Existing volume size {0} exceeds requested size {1}")]
+    ExistingSize(i64, i64),
 }
 
 impl From<ControllerError> for tonic::Status {
@@ -58,6 +61,9 @@ impl From<ControllerError> for tonic::Status {
             ControllerError::VolumeIdParse => {
                 tonic::Status::invalid_argument("Failed to parse volume ID")
             }
+            ControllerError::ExistingSize(current, requested) => tonic::Status::already_exists(
+                format!("Existing volume size {current} exceeds requested size {requested}"),
+            ),
         }
     }
 }

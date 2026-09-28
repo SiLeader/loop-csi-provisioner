@@ -8,9 +8,10 @@ use crate::proto::csi::v1::{
     NodeGetCapabilitiesResponse, NodeGetInfoRequest, NodeGetInfoResponse,
     NodeGetStorageHealthRequest, NodeGetStorageHealthResponse, NodeGetVolumeHealthRequest,
     NodeGetVolumeHealthResponse, NodeGetVolumeStatsRequest, NodeGetVolumeStatsResponse,
-    NodePublishVolumeRequest, NodePublishVolumeResponse, NodeStageVolumeRequest,
-    NodeStageVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
-    NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
+    NodePublishVolumeRequest, NodePublishVolumeResponse, NodeServiceCapability,
+    NodeStageVolumeRequest, NodeStageVolumeResponse, NodeUnpublishVolumeRequest,
+    NodeUnpublishVolumeResponse, NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
+    node_service_capability,
 };
 use tonic::{Request, Response, Status, async_trait};
 
@@ -43,7 +44,11 @@ impl Node for LoopCsiNode {
         &self,
         request: Request<NodeUnstageVolumeRequest>,
     ) -> Result<Response<NodeUnstageVolumeResponse>, Status> {
-        todo!()
+        let request = request.into_inner();
+        self.operator
+            .unstage_volume(&request.volume_id, &request.staging_target_path)
+            .await?;
+        Ok(Response::new(NodeUnstageVolumeResponse {}))
     }
 
     async fn node_publish_volume(
@@ -53,7 +58,11 @@ impl Node for LoopCsiNode {
         let request = request.into_inner();
 
         self.operator
-            .publish_volume(&request.staging_target_path, &request.target_path)
+            .publish_volume(
+                &request.staging_target_path,
+                &request.target_path,
+                request.readonly,
+            )
             .await?;
         Ok(Response::new(NodePublishVolumeResponse {}))
     }
@@ -62,21 +71,25 @@ impl Node for LoopCsiNode {
         &self,
         request: Request<NodeUnpublishVolumeRequest>,
     ) -> Result<Response<NodeUnpublishVolumeResponse>, Status> {
-        todo!()
+        let request = request.into_inner();
+        self.operator.unpublish_volume(&request.target_path).await?;
+        Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }
 
     async fn node_get_volume_stats(
         &self,
         _request: Request<NodeGetVolumeStatsRequest>,
     ) -> Result<Response<NodeGetVolumeStatsResponse>, Status> {
-        Err(Status::unavailable("NodeGetVolumeStats is not implemented"))
+        Err(Status::unimplemented(
+            "NodeGetVolumeStats is not implemented",
+        ))
     }
 
     async fn node_get_volume_health(
         &self,
         _request: Request<NodeGetVolumeHealthRequest>,
     ) -> Result<Response<NodeGetVolumeHealthResponse>, Status> {
-        Err(Status::unavailable(
+        Err(Status::unimplemented(
             "NodeGetVolumeHealth is not implemented",
         ))
     }
@@ -85,7 +98,7 @@ impl Node for LoopCsiNode {
         &self,
         _request: Request<NodeGetStorageHealthRequest>,
     ) -> Result<Response<NodeGetStorageHealthResponse>, Status> {
-        Err(Status::unavailable(
+        Err(Status::unimplemented(
             "NodeGetStorageHealth is not implemented",
         ))
     }
@@ -103,15 +116,41 @@ impl Node for LoopCsiNode {
 
     async fn node_get_capabilities(
         &self,
-        request: Request<NodeGetCapabilitiesRequest>,
+        _request: Request<NodeGetCapabilitiesRequest>,
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
-        todo!()
+        use node_service_capability::rpc::Type;
+        Ok(Response::new(NodeGetCapabilitiesResponse {
+            capabilities: [Type::StageUnstageVolume, Type::ExpandVolume]
+                .into_iter()
+                .map(|kind| NodeServiceCapability {
+                    r#type: Some(node_service_capability::Type::Rpc(
+                        node_service_capability::Rpc {
+                            r#type: kind as i32,
+                        },
+                    )),
+                })
+                .collect(),
+        }))
     }
 
     async fn node_get_info(
         &self,
-        request: Request<NodeGetInfoRequest>,
+        _request: Request<NodeGetInfoRequest>,
     ) -> Result<Response<NodeGetInfoResponse>, Status> {
-        todo!()
+        let node_id = std::env::var("NODE_ID")
+            .ok()
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            })
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Status::internal("Unable to determine node ID"))?;
+        Ok(Response::new(NodeGetInfoResponse {
+            node_id,
+            max_volumes_per_node: 0,
+            accessible_topology: None,
+        }))
     }
 }

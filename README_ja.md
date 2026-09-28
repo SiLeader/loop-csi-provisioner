@@ -37,9 +37,9 @@ API 選択フラグを省略すると、Identity、Controller、Node の各 API 
 
 ## Kubernetes 対応状況
 
-このリポジトリには、Kubernetes 向けの完全なデプロイ構成はまだありません。[`manifests/storageclass.yaml`](manifests/storageclass.yaml) は `url` パラメーターの指定例であり、**そのまま適用できる StorageClass ではありません**。`provisioner` が Identity サービスの返す名前と異なり、`fsType` も Node が使用する ext4 と一致していません。
+このリポジトリには、Kubernetes 向けの完全なデプロイ構成はまだありません。[`manifests/storageclass.yaml`](manifests/storageclass.yaml) は StorageClass の例です。Controller、Node DaemonSet、CSI サイドカー、ソケット、権限は別途設定する必要があります。
 
-現時点では、ボリュームの作成から利用までを通して実行できません。特に、`CreateVolume` は URL を含むボリューム ID を要求するパス処理に CSI ボリューム名のみを渡します。また、ローカルの `file://` パスではシンボリックリンクの作成前に同じパスを作成するため衝突します。ライフサイクル処理や機能通知の RPC にも `todo!()` または未実装エラーが残っています。この版を本番データに使用したり、サンプルの StorageClass で PVC を作成できると想定したりしないでください。
+基本的な作成、公開、ステージング、拡張、公開解除、ステージング解除、削除を実装しました。スナップショット、一覧、ヘルスチェックなどのオプションの CSI RPC は `UNIMPLEMENTED` を返します。Node でのマウントには、ループデバイスを備えた特権付き Linux ホストが必要です。自動テストはローカルファイルのライフサイクルを対象としており、特権が必要なマウント処理や NFS は対象外です。
 
 ## ライセンス
 

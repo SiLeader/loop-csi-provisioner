@@ -40,14 +40,4 @@ impl Mounter for NfsMounter {
             Err(res.into())
         }
     }
-
-    async fn unmount(&self, mount_point: &str) -> Result<(), MountError> {
-        let res = Command::new("umount").arg(mount_point).output().await?;
-
-        if res.status.success() {
-            Ok(())
-        } else {
-            Err(res.into())
-        }
-    }
 }

@@ -1,7 +1,10 @@
-use crate::proto::csi::v1::identity_server::Identity;
-use crate::proto::csi::v1::{plugin_capability, GetPluginCapabilitiesRequest, GetPluginCapabilitiesResponse, GetPluginInfoRequest, GetPluginInfoResponse, PluginCapability, ProbeRequest, ProbeResponse};
-use tonic::{Request, Response, Status, async_trait};
 use crate::VERSION;
+use crate::proto::csi::v1::identity_server::Identity;
+use crate::proto::csi::v1::{
+    GetPluginCapabilitiesRequest, GetPluginCapabilitiesResponse, GetPluginInfoRequest,
+    GetPluginInfoResponse, PluginCapability, ProbeRequest, ProbeResponse, plugin_capability,
+};
+use tonic::{Request, Response, Status, async_trait};
 
 pub struct NfsLoopCsiIdentity {}
 
@@ -31,21 +34,21 @@ impl Identity for NfsLoopCsiIdentity {
                         },
                     )),
                 },
-                PluginCapability{
+                PluginCapability {
                     r#type: Some(plugin_capability::Type::VolumeExpansion(
-                        plugin_capability::VolumeExpansion{
+                        plugin_capability::VolumeExpansion {
                             r#type: plugin_capability::volume_expansion::Type::Online as i32,
-                        }
+                        },
                     )),
-                }
+                },
             ],
         }))
     }
 
     async fn probe(
         &self,
-        request: Request<ProbeRequest>,
+        _request: Request<ProbeRequest>,
     ) -> Result<Response<ProbeResponse>, Status> {
-        todo!()
+        Ok(Response::new(ProbeResponse { ready: Some(true) }))
     }
 }

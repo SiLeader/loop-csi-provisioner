@@ -2,9 +2,9 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: nfs-loop
-provisioner: nfs-loop.csi.kinorca.com
+provisioner: loop-csi-provisioner
 parameters:
-  fsType: ext
+  fsType: ext4
   url: nfs://127.0.0.1/share
 reclaimPolicy: Delete
 allowVolumeExpansion: true

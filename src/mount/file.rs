@@ -22,12 +22,25 @@ impl Mounter for FileMounter {
     }
 
     async fn mount(&self, source: &Uri, mount_point: &str) -> Result<(), MountError> {
-        tokio::fs::symlink(source.path(), mount_point).await?;
-        Ok(())
-    }
-
-    async fn unmount(&self, mount_point: &str) -> Result<(), MountError> {
-        tokio::fs::remove_file(mount_point).await?;
+        let target = std::path::Path::new(source.path());
+        if !target.is_absolute() || !target.is_dir() {
+            return Err(MountError::InvalidFilePath(source.path().to_string()));
+        }
+        if let Some(parent) = std::path::Path::new(mount_point).parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        match tokio::fs::symlink_metadata(mount_point).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if tokio::fs::read_link(mount_point).await? != target {
+                    return Err(MountError::InvalidFilePath(source.path().to_string()));
+                }
+            }
+            Ok(_) => return Err(MountError::InvalidFilePath(source.path().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::symlink(target, mount_point).await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
 }

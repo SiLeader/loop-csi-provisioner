@@ -37,9 +37,9 @@ With no API selection flags, the process serves the Identity, Controller, and No
 
 ## Kubernetes status
 
-This repository does not yet include a complete Kubernetes deployment. [`manifests/storageclass.yaml`](manifests/storageclass.yaml) is an example of the intended `url` parameter, **not a ready-to-apply StorageClass**: its provisioner name differs from the name reported by the Identity service, and its `fsType` value does not match the ext4 formatter used by the node.
+This repository does not yet include a complete Kubernetes deployment. [`manifests/storageclass.yaml`](manifests/storageclass.yaml) is an example StorageClass; a controller, node DaemonSet, CSI sidecars, sockets, and privileges must be configured separately.
 
-End-to-end provisioning is not functional yet. In particular, `CreateVolume` passes the CSI volume name to a path helper that expects a URL-qualified volume ID; the local `file://` path currently conflicts with creation of its symlink; and several required lifecycle and capability RPCs still contain `todo!()` or return an unimplemented error. Do not use this version for production volumes or assume that the example StorageClass can provision a PVC.
+The basic create, publish, stage, expand, unpublish, unstage, and delete operations are implemented. Snapshot, listing, health, and other optional CSI RPCs return `UNIMPLEMENTED`. Node mounting requires a privileged Linux host with loop devices; the automated tests cover the local file lifecycle but do not exercise privileged mount operations or NFS.
 
 ## License
 
