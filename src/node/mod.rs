@@ -1,5 +1,5 @@
 mod error;
-mod operator;
+pub(crate) mod operator;
 
 use crate::node::operator::NodeOperator;
 use crate::proto::csi::v1::node_server::Node;

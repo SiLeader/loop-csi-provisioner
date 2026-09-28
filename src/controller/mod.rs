@@ -1,8 +1,7 @@
 mod error;
-mod operator;
+pub(crate) mod operator;
 
 use crate::controller::operator::ControllerOperator;
-use crate::mount::MountManager;
 use crate::proto::csi::v1::controller_server::Controller;
 use crate::proto::csi::v1::{
     ControllerExpandVolumeRequest, ControllerExpandVolumeResponse,
