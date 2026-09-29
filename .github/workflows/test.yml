@@ -24,6 +24,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Cache Rust build
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -49,6 +55,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Check code formatting
         shell: bash
         run: cargo fmt --all -- --check
@@ -73,6 +85,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-deny-${{ vars.CARGO_DENY_VERSION }}
 
       - name: Setup cargo-deny
+        shell: bash
         run: |
           if ! command -v cargo-deny &> /dev/null; then
             cargo install --locked cargo-deny --version ${{ vars.CARGO_DENY_VERSION }}
@@ -111,6 +124,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-deny-${{ vars.CARGO_DENY_VERSION }}
 
       - name: Setup cargo-deny
+        shell: bash
         run: |
           if ! command -v cargo-deny &> /dev/null; then
             cargo install --locked cargo-deny --version ${{ vars.CARGO_DENY_VERSION }}
