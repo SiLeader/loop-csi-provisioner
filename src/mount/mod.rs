@@ -1,6 +1,8 @@
 pub(crate) use crate::mount::error::MountError;
 
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::str::FromStr;
 use tonic::async_trait;
 use tonic::transport::Uri;
@@ -24,8 +26,10 @@ pub(crate) struct MountManager {
 
 impl Default for MountManager {
     fn default() -> Self {
-        let mounters: Vec<Box<dyn Mounter>> =
-            vec![Box::new(file::FileMounter), Box::new(nfs::NfsMounter)];
+        let mounters: Vec<Box<dyn Mounter>> = vec![
+            Box::new(file::FileMounter),
+            Box::new(nfs::NfsMounter::default()),
+        ];
         MountManager::new(mounters)
     }
 }
@@ -70,11 +74,25 @@ impl MountManager {
         }
     }
 
-    async fn check_mount_point(&self, target: &str) -> Result<bool, MountError> {
-        let output = tokio::process::Command::new("mountpoint")
-            .arg(target)
-            .status()
-            .await?;
-        Ok(output.success())
+    pub async fn check_mount_point(&self, target: &str) -> Result<bool, MountError> {
+        is_mountpoint(target).await
     }
+}
+
+async fn is_mountpoint(path: impl AsRef<Path>) -> Result<bool, MountError> {
+    let path = path.as_ref();
+
+    let meta = tokio::fs::metadata(path).await?;
+    if !meta.is_dir() {
+        return Ok(false);
+    }
+
+    let parent = match path.parent() {
+        Some(p) if p != path => p,
+        _ => return Ok(true),
+    };
+
+    let parent_meta = tokio::fs::metadata(parent).await?;
+
+    Ok(meta.dev() != parent_meta.dev())
 }

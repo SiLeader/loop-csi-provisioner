@@ -1,10 +1,14 @@
 use crate::mount::Mounter;
 use crate::mount::error::MountError;
+use crate::syscall::{MountOptions, MountSource, Syscall};
 use tokio::process::Command;
 use tonic::async_trait;
 use tonic::transport::Uri;
 
-pub struct NfsMounter;
+#[derive(Debug, Default)]
+pub struct NfsMounter {
+    syscall: Syscall,
+}
 
 #[async_trait]
 impl Mounter for NfsMounter {
@@ -30,14 +34,9 @@ impl Mounter for NfsMounter {
             return Err(MountError::HostIsMissing);
         };
         let src = format!("{}:{}", host, source.path());
-        let res = Command::new("mount")
-            .args(["-t", "nfs", &src, mount_point])
-            .output()
+        self.syscall
+            .mount(MountSource::nfs(&src), mount_point, MountOptions::default())
             .await?;
-        if res.status.success() {
-            Ok(())
-        } else {
-            Err(res.into())
-        }
+        Ok(())
     }
 }

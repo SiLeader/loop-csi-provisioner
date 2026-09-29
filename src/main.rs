@@ -20,6 +20,7 @@ mod identity;
 mod mount;
 mod node;
 mod proto;
+mod syscall;
 mod volume_id;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

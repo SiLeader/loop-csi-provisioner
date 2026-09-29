@@ -8,6 +8,9 @@ license = "Apache-2.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "process", "fs", "net", "signal"] }
 tokio-stream = { version = "0.1.19", features = ["net"] }
 
+rustix = { version = "1.1.5", features = ["mount", "fs"] }
+linux-raw-sys = { version = "0.12.1", features = ["loop_device"] }
+
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 

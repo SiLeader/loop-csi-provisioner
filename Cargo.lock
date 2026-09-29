@@ -495,8 +495,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "linux-raw-sys",
  "prost",
  "prost-types",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",
