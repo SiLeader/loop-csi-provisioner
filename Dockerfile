@@ -1,7 +1,7 @@
 FROM rust:1.98.1-slim-trixie AS builder
 
 RUN apt-get update &&  \
-    apt-get install -y --no-install-recommends protobuf-compiler &&  \
+    apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev &&  \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
