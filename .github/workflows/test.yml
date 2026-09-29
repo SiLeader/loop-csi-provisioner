@@ -150,10 +150,35 @@ jobs:
         shell: bash
         run: cargo deny check
 
+  helm:
+    # The runner image ships helm.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint the chart
+        shell: bash
+        run: helm lint --strict charts/loop-csi-provisioner --values test/e2e/helm-values.yaml
+
+      - name: Refuse to render without allowedUrlPrefixes
+        shell: bash
+        run: |
+          if helm template charts/loop-csi-provisioner > /dev/null; then
+            echo "::error::the chart rendered without allowedUrlPrefixes"
+            exit 1
+          fi
+
   e2e:
-    # Runs the driver on a kind cluster (the runner image ships kind and kubectl).
+    # Runs the driver on a kind cluster (the runner image ships kind, kubectl and helm).
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        deploy: [kustomize, helm]
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -162,4 +187,6 @@ jobs:
 
       - name: Run end-to-end test on kind
         shell: bash
+        env:
+          DEPLOY: ${{ matrix.deploy }}
         run: test/e2e/run.sh

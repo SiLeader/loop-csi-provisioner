@@ -8,10 +8,14 @@
 # Environment:
 #   CLUSTER       kind cluster name (default: loop-csi-e2e); an existing one is reused
 #   KEEP_CLUSTER  set to 1 to keep the cluster afterwards for debugging
+#   DEPLOY        kustomize (deploy/manifests, default) or helm (charts/loop-csi-provisioner)
+#   HELM          helm command (default: helm)
 set -euo pipefail
 
 CLUSTER=${CLUSTER:-loop-csi-e2e}
 KEEP_CLUSTER=${KEEP_CLUSTER:-0}
+DEPLOY=${DEPLOY:-kustomize}
+HELM=${HELM:-helm}
 IMAGE=loop-csi-provisioner:e2e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 E2E=$ROOT/test/e2e
@@ -77,8 +81,22 @@ fi
 kind load docker-image "$IMAGE" --name "$CLUSTER"
 docker exec "$NODE" mkdir -p "$STORAGE/volumes" "$STORAGE/metadata"
 
-log "deploying the driver"
-k apply -k "$E2E"
+log "deploying the driver with $DEPLOY"
+case $DEPLOY in
+kustomize)
+    k apply -k "$E2E"
+    ;;
+helm)
+    # The values keep the object names of the kustomize deployment.
+    "$HELM" upgrade --install loop-csi "$ROOT/charts/loop-csi-provisioner" \
+        --kube-context "kind-$CLUSTER" --namespace loop-csi --create-namespace \
+        --values "$E2E/helm-values.yaml"
+    ;;
+*)
+    echo "unknown DEPLOY: $DEPLOY" >&2
+    exit 1
+    ;;
+esac
 k -n loop-csi rollout status deploy/loop-csi-controller --timeout=180s
 k -n loop-csi rollout status ds/loop-csi-node --timeout=180s
 

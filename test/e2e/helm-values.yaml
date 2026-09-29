@@ -1,0 +1,35 @@
+# Values for DEPLOY=helm (see run.sh): the same deployment as kustomization.yaml.
+fullnameOverride: loop-csi
+image:
+  repository: loop-csi-provisioner
+  tag: e2e
+allowedUrlPrefixes:
+  - file:///var/lib/loop-csi-storage
+log:
+  format: text
+controller:
+  extraVolumes:
+    - name: storage
+      hostPath:
+        path: /var/lib/loop-csi-storage
+        type: Directory
+  extraVolumeMounts:
+    - name: storage
+      mountPath: /var/lib/loop-csi-storage
+node:
+  extraVolumes:
+    - name: storage
+      hostPath:
+        path: /var/lib/loop-csi-storage
+        type: Directory
+  extraVolumeMounts:
+    - name: storage
+      mountPath: /var/lib/loop-csi-storage
+storageClasses:
+  - name: loop-e2e
+    url: file:///var/lib/loop-csi-storage
+  # Points outside allowedUrlPrefixes; provisioning must be refused.
+  - name: loop-e2e-forbidden
+    url: file:///etc
+    allowVolumeExpansion: false
+    volumeBindingMode: Immediate

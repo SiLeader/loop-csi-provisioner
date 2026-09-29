@@ -76,13 +76,30 @@ PersistentVolume や StorageClass を作成できる人が、任意の URL を�
 ドライバーは `kubectl apply -k deploy/manifests` で適用し、StorageClass は環境に合わせて編集してから適用してください。マニフェストは kind
 上では検証していますが（後述）、本番クラスターではまだ試していません。使用前に、イメージのタグ、`--allowed-url-prefix` の値、権限を確認してください。
 
+同じ構成を Helm チャート [charts/loop-csi-provisioner](charts/loop-csi-provisioner) としても提供しています。リリース時には
+`oci://ghcr.io/sileader/charts/loop-csi-provisioner` にも push されます。`allowedUrlPrefixes` は必須で、`storageClasses`
+を指定すると StorageClass も作成します。
+
+```sh
+helm install loop-csi-provisioner oci://ghcr.io/sileader/charts/loop-csi-provisioner \
+  --namespace loop-csi --create-namespace \
+  --set 'allowedUrlPrefixes={nfs://nfs.example.com/export}' \
+  --set 'storageClasses[0].name=nfs-loop' \
+  --set 'storageClasses[0].url=nfs://nfs.example.com/export/loop-csi'
+```
+
+`file://` の保存先を使う場合は、`controller.extraVolumes`、`controller.extraVolumeMounts`、`node.extraVolumes`、
+`node.extraVolumeMounts` でそのディレクトリを Controller と Node の両方の Pod にマウントしてください。kubelet のルートが
+`/var/lib/kubelet` でないディストリビューションでは `kubeletDir` を設定してください。すべての設定項目は
+[values.yaml](charts/loop-csi-provisioner/values.yaml) を参照してください。
+
 基本的な作成、公開、ステージング、拡張、公開解除、ステージング解除、削除を実装しました。スナップショット、一覧、ヘルスチェックなどのオプションの
 CSI RPC は `UNIMPLEMENTED` を返します。Node でのマウントには、ループデバイスを備えた特権付き Linux
 ホストが必要です。
 
 単体テスト（`cargo test`）は Controller のローカルファイルのライフサイクルを対象とし、特権は不要です。E2E テスト
 [test/e2e/run.sh](test/e2e/run.sh) はイメージをビルドし、kind ノード上の `file://` 保存先を使って [kind](https://kind.sigs.k8s.io/)
-クラスターにマニフェストを適用します。そのうえで PVC の作成、書き込み、オンライン拡張、読み取り専用での再マウント、Multi-Mount Protection、
+クラスターにマニフェストを適用します（`DEPLOY=helm` を指定すると代わりに Helm チャートをインストールします）。そのうえで PVC の作成、書き込み、オンライン拡張、読み取り専用での再マウント、Multi-Mount Protection、
 削除までを確認します。Docker、kind、kubectl と、ループデバイスを使えるホストカーネルが必要です。`KEEP_CLUSTER=1` を指定すると、
 デバッグ用にクラスターを残します。NFS の保存先はまだ対象外です。
 

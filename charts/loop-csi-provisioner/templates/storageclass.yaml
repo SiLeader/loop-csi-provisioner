@@ -1,0 +1,34 @@
+{{- range .Values.storageClasses }}
+{{- if not .name }}
+{{- fail "every entry of storageClasses needs a name" }}
+{{- end }}
+{{- if not .url }}
+{{- fail (printf "storageClasses %s needs a url" .name) }}
+{{- end }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "loop-csi-provisioner.labels" $ | nindent 4 }}
+    {{- with .labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if or .isDefault .annotations }}
+  annotations:
+    {{- if .isDefault }}
+    storageclass.kubernetes.io/is-default-class: "true"
+    {{- end }}
+    {{- with .annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+provisioner: {{ include "loop-csi-provisioner.driverName" $ }}
+parameters:
+  fsType: {{ .fsType | default "ext4" }}
+  url: {{ .url }}
+reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
+allowVolumeExpansion: {{ if hasKey . "allowVolumeExpansion" }}{{ .allowVolumeExpansion }}{{ else }}true{{ end }}
+volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
+{{- end }}

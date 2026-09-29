@@ -1,0 +1,135 @@
+{{- $registrar := .Values.sidecars.nodeDriverRegistrar }}
+{{- $kubeletDir := .Values.kubeletDir | trimSuffix "/" }}
+{{- $pluginDir := printf "%s/plugins/%s" $kubeletDir (include "loop-csi-provisioner.driverName" .) }}
+{{- with .Values.node }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "loop-csi-provisioner.fullname" $ }}-node
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "loop-csi-provisioner.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      {{- include "loop-csi-provisioner.selectorLabels" (dict "context" $ "component" "node") | nindent 6 }}
+  {{- with .updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "loop-csi-provisioner.selectorLabels" (dict "context" $ "component" "node") | nindent 8 }}
+        {{- with .podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      # The node plugin needs no Kubernetes API access.
+      automountServiceAccountToken: false
+      {{- with .priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: driver
+          image: {{ include "loop-csi-provisioner.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args:
+            - --node-api
+            - --identity-api
+            {{- include "loop-csi-provisioner.driverArgs" $ | nindent 12 }}
+            {{- with .extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            # Must match the node name the attacher sees, since ControllerPublish records it.
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- include "loop-csi-provisioner.driverEnv" $ | nindent 12 }}
+            {{- with .extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            # Needs loop devices and mount(2).
+            privileged: true
+          {{- with .resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: kubelet
+              mountPath: {{ $kubeletDir }}
+              # Staging and publish mounts must appear in the host's mount namespace.
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+            - name: base
+              mountPath: /var/lib/loop-csi-provisioner
+            {{- with .extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        - name: node-driver-registrar
+          image: {{ include "loop-csi-provisioner.sidecarImage" $registrar }}
+          imagePullPolicy: {{ $registrar.image.pullPolicy }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ $pluginDir }}/csi.sock
+            {{- with $registrar.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with $registrar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: registration
+              mountPath: /registration
+      volumes:
+        - name: socket
+          hostPath:
+            path: {{ $pluginDir }}
+            type: DirectoryOrCreate
+        - name: kubelet
+          hostPath:
+            path: {{ $kubeletDir }}
+            type: Directory
+        - name: registration
+          hostPath:
+            path: {{ $kubeletDir }}/plugins_registry
+            type: Directory
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: base
+          emptyDir: {}
+        {{- with .extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

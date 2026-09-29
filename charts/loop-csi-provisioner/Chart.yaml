@@ -1,0 +1,21 @@
+apiVersion: v2
+name: loop-csi-provisioner
+description: CSI driver providing ext4 volumes backed by image files in a local directory or an NFS export
+type: application
+# version and appVersion are bumped together by .github/workflows/release.yml.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/SiLeader/loop-csi-provisioner
+sources:
+  - https://github.com/SiLeader/loop-csi-provisioner
+keywords:
+  - csi
+  - storage
+  - loop
+  - nfs
+maintainers:
+  - name: SiLeader
+    email: sileader.dev@gmail.com
+annotations:
+  artifacthub.io/license: Apache-2.0

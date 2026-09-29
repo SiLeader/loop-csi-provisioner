@@ -1,0 +1,16 @@
+{{- if .Values.csiDriver.create }}
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: {{ include "loop-csi-provisioner.driverName" . }}
+  labels:
+    {{- include "loop-csi-provisioner.labels" . | nindent 4 }}
+spec:
+  # The driver advertises PUBLISH_UNPUBLISH_VOLUME, so the attach step is required.
+  attachRequired: true
+  podInfoOnMount: false
+  storageCapacity: false
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent
+{{- end }}

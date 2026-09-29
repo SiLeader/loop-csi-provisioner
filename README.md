@@ -77,13 +77,30 @@ Apply the driver with `kubectl apply -k deploy/manifests`, then adapt and apply 
 exercised on kind (see below) but not yet on a production cluster; review the image tag, the `--allowed-url-prefix`
 value, and the privileges before use.
 
+The same deployment is available as the Helm chart [charts/loop-csi-provisioner](charts/loop-csi-provisioner), which
+releases also push to `oci://ghcr.io/sileader/charts/loop-csi-provisioner`. `allowedUrlPrefixes` is required, and
+`storageClasses` optionally creates StorageClasses:
+
+```sh
+helm install loop-csi-provisioner oci://ghcr.io/sileader/charts/loop-csi-provisioner \
+  --namespace loop-csi --create-namespace \
+  --set 'allowedUrlPrefixes={nfs://nfs.example.com/export}' \
+  --set 'storageClasses[0].name=nfs-loop' \
+  --set 'storageClasses[0].url=nfs://nfs.example.com/export/loop-csi'
+```
+
+For `file://` storage, mount the directory into both the controller and node pods with `controller.extraVolumes`,
+`controller.extraVolumeMounts`, `node.extraVolumes`, and `node.extraVolumeMounts`. Set `kubeletDir` on distributions
+whose kubelet root is not `/var/lib/kubelet`. See [values.yaml](charts/loop-csi-provisioner/values.yaml) for all options.
+
 The basic create, publish, stage, expand, unpublish, unstage, and delete operations are implemented. Snapshot, listing,
 health, and other optional CSI RPCs return `UNIMPLEMENTED`. Node mounting requires a privileged Linux host with loop
 devices.
 
 Unit tests (`cargo test`) cover the controller's local file lifecycle and need no privileges. The end-to-end test
 [test/e2e/run.sh](test/e2e/run.sh) builds the image, deploys the manifests to a [kind](https://kind.sigs.k8s.io/)
-cluster with a `file://` storage directory on the kind node, and takes a PVC through provisioning, writing, online
+cluster with a `file://` storage directory on the kind node (with `DEPLOY=helm`, it installs the Helm chart instead),
+and takes a PVC through provisioning, writing, online
 expansion, a read-only remount, multi-mount protection, and deletion. It needs Docker, kind, kubectl, and a host kernel
 with loop devices; set `KEEP_CLUSTER=1` to keep the cluster for debugging. NFS backing storage is not covered yet.
 

@@ -1,0 +1,124 @@
+image:
+  repository: ghcr.io/sileader/loop-csi-provisioner
+  # Defaults to v<appVersion>.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Storage URLs the driver may mount, matched on "/" boundaries, e.g. nfs://nfs.example.com/export.
+# Required: the URL is part of every volume ID, so without a restriction whoever can create a
+# PersistentVolume or StorageClass could make the privileged driver mount any URL.
+allowedUrlPrefixes: []
+
+# Fallback volume size in bytes when a PVC requests none (driver default: 1 GiB).
+defaultSize: null
+
+log:
+  # RUST_LOG filter, e.g. info or loop_csi_provisioner=debug.
+  level: info
+  # json or text.
+  format: json
+
+# Host path of the kubelet root directory (e.g. /var/snap/microk8s/common/var/lib/kubelet on MicroK8s).
+kubeletDir: /var/lib/kubelet
+
+csiDriver:
+  # Set to false if the CSIDriver object is managed elsewhere.
+  create: true
+
+serviceAccount:
+  create: true
+  # Defaults to <fullname>-controller.
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+
+# StorageClasses to create. Each url must be allowed by allowedUrlPrefixes.
+storageClasses: []
+#  - name: nfs-loop
+#    url: nfs://nfs.example.com/export/loop-csi
+#    isDefault: false
+#    fsType: ext4
+#    reclaimPolicy: Delete
+#    allowVolumeExpansion: true
+#    volumeBindingMode: WaitForFirstConsumer
+#    labels: {}
+#    annotations: {}
+
+controller:
+  # The driver serializes operations per volume inside one process only, so the Deployment always
+  # runs a single replica.
+  extraArgs: []
+  extraEnv: []
+  resources: {}
+  # Volumes for file:// storage URLs, which must be visible at the same path in the controller and
+  # node pods, e.g.:
+  #   extraVolumes:
+  #     - name: storage
+  #       hostPath:
+  #         path: /srv/loop-csi
+  #         type: Directory
+  #   extraVolumeMounts:
+  #     - name: storage
+  #       mountPath: /srv/loop-csi
+  extraVolumes: []
+  extraVolumeMounts: []
+  podLabels: {}
+  podAnnotations: {}
+  priorityClassName: system-cluster-critical
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+node:
+  extraArgs: []
+  extraEnv: []
+  resources: {}
+  # See controller.extraVolumes.
+  extraVolumes: []
+  extraVolumeMounts: []
+  podLabels: {}
+  podAnnotations: {}
+  priorityClassName: system-node-critical
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  updateStrategy:
+    type: RollingUpdate
+
+sidecars:
+  provisioner:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-provisioner
+      tag: v5.1.0
+      pullPolicy: IfNotPresent
+    timeout: 120s
+    extraArgs: []
+    resources: {}
+  attacher:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-attacher
+      tag: v4.8.0
+      pullPolicy: IfNotPresent
+    extraArgs: []
+    resources: {}
+  resizer:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-resizer
+      tag: v1.13.1
+      pullPolicy: IfNotPresent
+    extraArgs: []
+    resources: {}
+  nodeDriverRegistrar:
+    image:
+      repository: registry.k8s.io/sig-storage/csi-node-driver-registrar
+      tag: v2.13.0
+      pullPolicy: IfNotPresent
+    extraArgs: []
+    resources: {}
+
+nameOverride: ""
+fullnameOverride: ""

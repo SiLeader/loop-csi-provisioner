@@ -1,0 +1,22 @@
+loop-csi-provisioner {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+Allowed storage URL prefixes:
+{{- range .Values.allowedUrlPrefixes }}
+  - {{ . }}
+{{- end }}
+
+Each backing directory must already contain writable volumes/ and metadata/ subdirectories.
+{{- if .Values.storageClasses }}
+
+StorageClasses:
+{{- range .Values.storageClasses }}
+  - {{ .name }} ({{ .url }})
+{{- end }}
+{{- else }}
+
+No StorageClass was created. Set storageClasses, or create one with
+provisioner: {{ include "loop-csi-provisioner.driverName" . }} and a url parameter under an allowed prefix.
+{{- end }}
+
+Check the pods with:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
