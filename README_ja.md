@@ -101,7 +101,8 @@ CSI RPC は `UNIMPLEMENTED` を返します。Node でのマウントには、�
 [test/e2e/run.sh](test/e2e/run.sh) はイメージをビルドし、kind ノード上の `file://` 保存先を使って [kind](https://kind.sigs.k8s.io/)
 クラスターにマニフェストを適用します（`DEPLOY=helm` を指定すると代わりに Helm チャートをインストールします）。そのうえで PVC の作成、書き込み、オンライン拡張、読み取り専用での再マウント、Multi-Mount Protection、
 削除までを確認します。Docker、kind、kubectl と、ループデバイスを使えるホストカーネルが必要です。`KEEP_CLUSTER=1` を指定すると、
-デバッグ用にクラスターを残します。NFS の保存先はまだ対象外です。
+デバッグ用にクラスターを残します。`BACKEND=nfs` を指定すると、クラスター内の NFS サーバー Pod が提供する NFS エクスポートを
+保存先として同じ確認を行います（ホストカーネルに `nfs` と `nfsd` モジュールが必要です）。
 
 ## ライセンス
 

@@ -1,0 +1,49 @@
+# NFS server for BACKEND=nfs (see run.sh): the kernel NFS server image of the Kubernetes e2e
+# tests, exporting an emptyDir as the NFSv4 root. The driver reaches it through the Service.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: loop-csi-nfs
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nfs-server
+  namespace: loop-csi-nfs
+  labels:
+    app: nfs-server
+spec:
+  terminationGracePeriodSeconds: 0
+  containers:
+    - name: server
+      image: registry.k8s.io/e2e-test-images/volume/nfs:1.4
+      args: [/exports]
+      securityContext:
+        # Runs the in-kernel NFS server.
+        privileged: true
+      ports:
+        - name: nfs
+          containerPort: 2049
+      readinessProbe:
+        tcpSocket:
+          port: nfs
+        periodSeconds: 2
+      volumeMounts:
+        # The container's overlayfs root cannot be exported.
+        - name: exports
+          mountPath: /exports
+  volumes:
+    - name: exports
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfs-server
+  namespace: loop-csi-nfs
+spec:
+  selector:
+    app: nfs-server
+  ports:
+    - name: nfs
+      port: 2049

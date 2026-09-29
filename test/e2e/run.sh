@@ -1,30 +1,51 @@
 #!/usr/bin/env bash
 # End-to-end test on a kind cluster.
 #
-# Builds the driver image, deploys it with a file:// storage directory on the kind node,
-# and takes a PVC through provisioning, writing, online expansion, a read-only remount,
-# and deletion. Needs docker, kind, and kubectl; the host kernel must provide loop devices.
+# Builds the driver image, deploys it with a file:// storage directory on the kind node or
+# an NFS export served inside the cluster, and takes a PVC through provisioning, writing,
+# online expansion, a read-only remount, and deletion. Needs docker, kind, and kubectl; the
+# host kernel must provide loop devices, and for BACKEND=nfs the NFS server and client.
 #
 # Environment:
 #   CLUSTER       kind cluster name (default: loop-csi-e2e); an existing one is reused
 #   KEEP_CLUSTER  set to 1 to keep the cluster afterwards for debugging
 #   DEPLOY        kustomize (deploy/manifests, default) or helm (charts/loop-csi-provisioner)
 #   HELM          helm command (default: helm)
+#   BACKEND       file (a directory on the kind node, default) or nfs (test/e2e/nfs/server.yaml)
 set -euo pipefail
 
 CLUSTER=${CLUSTER:-loop-csi-e2e}
 KEEP_CLUSTER=${KEEP_CLUSTER:-0}
 DEPLOY=${DEPLOY:-kustomize}
 HELM=${HELM:-helm}
+BACKEND=${BACKEND:-file}
 IMAGE=loop-csi-provisioner:e2e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 E2E=$ROOT/test/e2e
 NODE=$CLUSTER-control-plane
-STORAGE=/var/lib/loop-csi-storage
 KUBECTL=(kubectl --context "kind-$CLUSTER")
 
 log() { printf '\n=== %s\n' "$*"; }
 k() { "${KUBECTL[@]}" "$@"; }
+
+# CONFIG holds the kustomization and Helm values; STORAGE is the backing directory as seen
+# by storage(), which runs a command where that directory is local.
+case $BACKEND in
+file)
+    CONFIG=$E2E
+    STORAGE=/var/lib/loop-csi-storage
+    storage() { docker exec "$NODE" "$@"; }
+    ;;
+nfs)
+    CONFIG=$E2E/nfs
+    STORAGE=/exports/loop
+    storage() { k -n loop-csi-nfs exec nfs-server -- "$@"; }
+    ;;
+*)
+    echo "unknown BACKEND: $BACKEND" >&2
+    exit 1
+    ;;
+esac
 
 # wait_for DESCRIPTION TIMEOUT_SECONDS COMMAND...: retries COMMAND until it succeeds.
 wait_for() {
@@ -50,6 +71,20 @@ dump_diagnostics() {
     done
     echo "--- node/driver"
     k -n loop-csi logs ds/loop-csi-node -c driver --tail=200 || true
+    if [[ $BACKEND == nfs ]]; then
+        echo "--- nfs-server"
+        k -n loop-csi-nfs logs nfs-server --tail=40 || true
+    fi
+}
+
+# Makes everything that uses the NFS export let go of it while the server still runs: kind
+# removes the server along with the cluster, after which a hard-mounted client blocks
+# forever in the kernel and the kind node container can no longer be removed.
+release_nfs() {
+    k delete pod writer reader --ignore-not-found --timeout=60s
+    k delete pvc data --ignore-not-found --timeout=120s
+    k -n loop-csi delete deploy/loop-csi-controller ds/loop-csi-node --ignore-not-found --timeout=120s
+    k -n loop-csi wait pod --all --for=delete --timeout=120s
 }
 
 finish() {
@@ -61,7 +96,12 @@ finish() {
         echo "E2E PASSED"
     fi
     if [[ $KEEP_CLUSTER != 1 ]]; then
-        kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+        if [[ $BACKEND == nfs ]]; then
+            release_nfs >/dev/null 2>&1 || true
+        fi
+        if ! kind delete cluster --name "$CLUSTER" >/dev/null; then
+            echo "failed to delete the kind cluster $CLUSTER" >&2
+        fi
     fi
     exit "$status"
 }
@@ -79,18 +119,24 @@ if ! kind get clusters | grep -qx "$CLUSTER"; then
     kind create cluster --name "$CLUSTER" --wait 120s
 fi
 kind load docker-image "$IMAGE" --name "$CLUSTER"
-docker exec "$NODE" mkdir -p "$STORAGE/volumes" "$STORAGE/metadata"
+
+log "preparing the $BACKEND storage"
+if [[ $BACKEND == nfs ]]; then
+    k apply -f "$E2E/nfs/server.yaml"
+    k -n loop-csi-nfs wait pod/nfs-server --for=condition=Ready --timeout=180s
+fi
+storage mkdir -p "$STORAGE/volumes" "$STORAGE/metadata"
 
 log "deploying the driver with $DEPLOY"
 case $DEPLOY in
 kustomize)
-    k apply -k "$E2E"
+    k apply -k "$CONFIG"
     ;;
 helm)
     # The values keep the object names of the kustomize deployment.
     "$HELM" upgrade --install loop-csi "$ROOT/charts/loop-csi-provisioner" \
         --kube-context "kind-$CLUSTER" --namespace loop-csi --create-namespace \
-        --values "$E2E/helm-values.yaml"
+        --values "$CONFIG/helm-values.yaml"
     ;;
 *)
     echo "unknown DEPLOY: $DEPLOY" >&2
@@ -115,20 +161,27 @@ k apply -f "$E2E/workload.yaml"
 k wait pod/writer --for=condition=Ready --timeout=300s
 pv=$(k get pvc data -o jsonpath='{.spec.volumeName}')
 image=$STORAGE/volumes/$pv.img
-docker exec "$NODE" test -f "$image"
+storage test -f "$image"
+# The path of the image in the node pod: under the file:// directory or the NFS mount.
+node_image=$(k -n loop-csi exec ds/loop-csi-node -c driver -- \
+    sh -c 'cat /sys/block/loop*/loop/backing_file 2>/dev/null' | grep "/$pv\.img$")
+if [[ $BACKEND == nfs && $node_image != /var/lib/loop-csi-provisioner/nfs-* ]]; then
+    echo "the loop device is not backed by the NFS mount: $node_image" >&2
+    exit 1
+fi
 in_pod writer 'dd if=/dev/urandom of=/data/blob bs=1M count=8 2>/dev/null && sync'
 checksum=$(in_pod writer 'sha256sum /data/blob' | cut -d' ' -f1)
 size_before=$(fs_size_kib writer)
-echo "pv=$pv filesystem=${size_before}KiB checksum=$checksum"
-k -n loop-csi exec ds/loop-csi-node -c driver -- dumpe2fs -h "$image" 2>/dev/null |
+echo "pv=$pv image=$node_image filesystem=${size_before}KiB checksum=$checksum"
+k -n loop-csi exec ds/loop-csi-node -c driver -- dumpe2fs -h "$node_image" 2>/dev/null |
     grep -q '^Filesystem features:.*\bmmp\b'
 # ControllerPublishVolume recorded the attachment next to the image.
-docker exec "$NODE" grep -q "\"attachedNode\":\"$NODE\"" "$STORAGE/metadata/$pv.json"
+storage grep -q "\"attachedNode\":\"$NODE\"" "$STORAGE/metadata/$pv.json"
 
 log "multi-mount protection refuses a second writer of the image"
 # Stands in for another node that attaches the image while it is in use, e.g. after a
 # force-detach: the kernel must refuse the mount instead of corrupting the filesystem.
-second_mount_output=$(k -n loop-csi exec -i ds/loop-csi-node -c driver -- bash -s "$image" 2>&1 <<'SCRIPT' || true
+second_mount_output=$(k -n loop-csi exec -i ds/loop-csi-node -c driver -- bash -s "$node_image" 2>&1 <<'SCRIPT' || true
 set -eu
 # `losetup -f` has the kernel create a free device, whose node this /dev may lack; it then
 # prints e.g. "/dev/loop17 (lost)".
@@ -176,8 +229,15 @@ k delete pod reader --wait=true
 k delete pvc data --wait=true
 pv_gone() { ! k get pv "$pv"; }
 wait_for "the PV to be deleted" 180 pv_gone
-docker exec "$NODE" test ! -e "$image"
-docker exec "$NODE" test ! -e "$STORAGE/metadata/$pv.json"
+storage test ! -e "$image"
+storage test ! -e "$STORAGE/metadata/$pv.json"
+# Nothing is left behind, such as the .nfs* file an NFS client leaves when it removes a
+# file that is still open.
+leftovers=$(storage ls -A "$STORAGE/volumes")
+if [[ -n $leftovers ]]; then
+    echo "files are left in $STORAGE/volumes: $leftovers" >&2
+    exit 1
+fi
 # Unstaging must have detached the loop device.
 if docker exec "$NODE" sh -c "cat /sys/block/loop*/loop/backing_file 2>/dev/null" | grep -q "$pv"; then
     echo "a loop device is still attached to $image" >&2

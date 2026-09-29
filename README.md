@@ -101,8 +101,9 @@ Unit tests (`cargo test`) cover the controller's local file lifecycle and need n
 [test/e2e/run.sh](test/e2e/run.sh) builds the image, deploys the manifests to a [kind](https://kind.sigs.k8s.io/)
 cluster with a `file://` storage directory on the kind node (with `DEPLOY=helm`, it installs the Helm chart instead),
 and takes a PVC through provisioning, writing, online
-expansion, a read-only remount, multi-mount protection, and deletion. It needs Docker, kind, kubectl, and a host kernel
-with loop devices; set `KEEP_CLUSTER=1` to keep the cluster for debugging. NFS backing storage is not covered yet.
+expansion, a read-only remount, multi-mount protection, and deletion. With `BACKEND=nfs`, the volumes are stored on an
+NFS export served by an in-cluster NFS server pod instead. It needs Docker, kind, kubectl, and a host kernel with loop
+devices (and, for `BACKEND=nfs`, the `nfs` and `nfsd` modules); set `KEEP_CLUSTER=1` to keep the cluster for debugging.
 
 ## License
 

@@ -1,0 +1,17 @@
+# Values for BACKEND=nfs DEPLOY=helm (see run.sh): the same deployment as kustomization.yaml.
+fullnameOverride: loop-csi
+image:
+  repository: loop-csi-provisioner
+  tag: e2e
+allowedUrlPrefixes:
+  - nfs://nfs-server.loop-csi-nfs.svc.cluster.local/loop
+log:
+  format: text
+storageClasses:
+  - name: loop-e2e
+    url: nfs://nfs-server.loop-csi-nfs.svc.cluster.local/loop
+  # Shares the text of allowedUrlPrefixes but not a path boundary; provisioning must be refused.
+  - name: loop-e2e-forbidden
+    url: nfs://nfs-server.loop-csi-nfs.svc.cluster.local/loop-other
+    allowVolumeExpansion: false
+    volumeBindingMode: Immediate

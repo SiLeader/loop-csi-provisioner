@@ -161,7 +161,10 @@ jobs:
 
       - name: Lint the chart
         shell: bash
-        run: helm lint --strict charts/loop-csi-provisioner --values test/e2e/helm-values.yaml
+        run: |
+          for values in test/e2e/helm-values.yaml test/e2e/nfs/helm-values.yaml; do
+            helm lint --strict charts/loop-csi-provisioner --values "$values"
+          done
 
       - name: Refuse to render without allowedUrlPrefixes
         shell: bash
@@ -179,14 +182,21 @@ jobs:
       fail-fast: false
       matrix:
         deploy: [kustomize, helm]
+        backend: [file, nfs]
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Load NFS kernel modules
+        if: matrix.backend == 'nfs'
+        shell: bash
+        run: sudo modprobe -a nfs nfsd
+
       - name: Run end-to-end test on kind
         shell: bash
         env:
           DEPLOY: ${{ matrix.deploy }}
+          BACKEND: ${{ matrix.backend }}
         run: test/e2e/run.sh
