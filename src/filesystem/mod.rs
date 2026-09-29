@@ -4,6 +4,7 @@ use tokio::process::Command;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Filesystem {
     Ext4,
+    /// Recognized so it is never formatted over, but not supported for mounting or resizing.
     Xfs,
 }
 
@@ -26,12 +27,19 @@ pub(crate) enum FsError {
     Command(CommandError),
 }
 
+fn unsupported(filesystem: Filesystem) -> FsError {
+    FsError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("{filesystem:?} is not supported"),
+    ))
+}
+
 impl FilesystemManager {
     pub async fn resize(&self, filesystem: Filesystem, device: &str) -> Result<(), FsError> {
-        let res = match filesystem {
-            Filesystem::Ext4 => Command::new("resize2fs").arg(device).output().await?,
-            Filesystem::Xfs => Command::new("xfs_glowfs").arg(device).output().await?,
-        };
+        if filesystem != Filesystem::Ext4 {
+            return Err(unsupported(filesystem));
+        }
+        let res = Command::new("resize2fs").arg(device).output().await?;
         if res.status.success() {
             Ok(())
         } else {
@@ -39,25 +47,17 @@ impl FilesystemManager {
         }
     }
 
+    /// Formats `device`. Callers must make sure the device holds no data worth keeping:
+    /// no `-F`-style override is passed, so `mkfs` also refuses devices it finds in use.
     pub async fn create(
         &self,
         filesystem: Filesystem,
         device: &str,
     ) -> Result<Filesystem, FsError> {
-        let res = match filesystem {
-            Filesystem::Ext4 => {
-                Command::new("mkfs.ext4")
-                    .args(["-F", device])
-                    .output()
-                    .await?
-            }
-            Filesystem::Xfs => {
-                Command::new("mkfs.xfs")
-                    .args(["-f", device])
-                    .output()
-                    .await?
-            }
-        };
+        if filesystem != Filesystem::Ext4 {
+            return Err(unsupported(filesystem));
+        }
+        let res = Command::new("mkfs.ext4").arg(device).output().await?;
         if res.status.success() {
             Ok(filesystem)
         } else {

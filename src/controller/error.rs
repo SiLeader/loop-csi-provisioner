@@ -42,6 +42,13 @@ impl From<ControllerError> for tonic::Status {
             ControllerError::NotFound(volume_id) => {
                 tonic::Status::not_found(format!("Volume {} not found", volume_id))
             }
+            ControllerError::Mount(crate::mount::MountError::UrlNotAllowed(url)) => {
+                tonic::Status::permission_denied(format!("Storage URL {} is not allowed", url))
+            }
+            ControllerError::Mount(
+                e @ (crate::mount::MountError::InvalidUrl(_)
+                | crate::mount::MountError::UnsupportedProtocol(_)),
+            ) => tonic::Status::invalid_argument(format!("Mount error: {}", e)),
             ControllerError::Mount(e) => tonic::Status::internal(format!("Mount error: {}", e)),
             ControllerError::AlreadyAttached {
                 volume_id,

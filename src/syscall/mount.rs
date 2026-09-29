@@ -1,5 +1,6 @@
 use crate::filesystem::Filesystem;
 use crate::syscall::Syscall;
+use rustix::fs::{StatVfsMountFlags, statvfs};
 use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub(crate) enum MountSource {
     Bind(PathBuf),
-    Nfs(PathBuf),
     Fs(FsMountSource),
 }
 
@@ -26,10 +26,6 @@ pub(crate) struct MountOptions {
 impl MountSource {
     pub fn bind(path: impl AsRef<Path>) -> Self {
         Self::Bind(path.as_ref().to_path_buf())
-    }
-
-    pub fn nfs(path: impl AsRef<Path>) -> Self {
-        Self::Nfs(path.as_ref().to_path_buf())
     }
 
     pub fn fs(fs: Filesystem, path: impl AsRef<Path>) -> Self {
@@ -78,7 +74,6 @@ impl Syscall {
     ) -> std::io::Result<()> {
         match source {
             MountSource::Bind(source) => self.mount_bind(source, target, options).await,
-            MountSource::Nfs(source) => self.mount_nfs(source, target, options).await,
             MountSource::Fs(source) => self.mount_fs(source, target, options).await,
         }
     }
@@ -122,18 +117,6 @@ impl Syscall {
         .await
     }
 
-    async fn mount_nfs(
-        &self,
-        source: impl AsRef<Path>,
-        target: impl AsRef<Path>,
-        options: MountOptions,
-    ) -> std::io::Result<()> {
-        let source = source.as_ref().to_path_buf();
-        let target = target.as_ref().to_path_buf();
-
-        Self::spawn(move || Ok(mount(source, target, "nfs", options.flags(), None)?)).await
-    }
-
     fn mount_ext4(
         source: impl AsRef<Path>,
         target: impl AsRef<Path>,
@@ -152,5 +135,12 @@ impl Syscall {
         let target = target.as_ref().to_path_buf();
 
         Self::spawn(move || Ok(unmount(target, UnmountFlags::empty())?)).await
+    }
+
+    /// Returns true when the filesystem mounted at `path` is mounted read-only.
+    pub async fn is_readonly(&self, path: impl AsRef<Path>) -> std::io::Result<bool> {
+        let path = path.as_ref().to_path_buf();
+
+        Self::spawn(move || Ok(statvfs(path)?.f_flag.contains(StatVfsMountFlags::RDONLY))).await
     }
 }

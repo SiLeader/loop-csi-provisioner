@@ -1,0 +1,12 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: loop-csi-provisioner
+spec:
+  # The driver advertises PUBLISH_UNPUBLISH_VOLUME, so the attach step is required.
+  attachRequired: true
+  podInfoOnMount: false
+  storageCapacity: false
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent

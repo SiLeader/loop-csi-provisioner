@@ -1,23 +1,28 @@
 use clap::Parser;
 use std::net::SocketAddr;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::controller::LoopCsiController;
 use crate::controller::operator::ControllerOperator;
+use crate::mount::MountManager;
 use crate::node::LoopCsiNode;
 use crate::node::operator::NodeOperator;
 use crate::proto::csi::v1::controller_server::ControllerServer;
 use crate::proto::csi::v1::identity_server::IdentityServer;
 use crate::proto::csi::v1::node_server::NodeServer;
 
+mod capability;
 mod controller;
 mod filesystem;
 mod identity;
+mod lock;
 mod mount;
 mod node;
 mod proto;
@@ -58,6 +63,13 @@ struct Args {
     )]
     default_size: i64,
 
+    #[arg(
+        long = "allowed-url-prefix",
+        help = "Only allow storage URLs equal to or below this prefix, e.g. nfs://nfs.example.com/export. \
+                Repeatable. Without it, any URL found in a volume ID or StorageClass is mounted"
+    )]
+    allowed_url_prefixes: Vec<String>,
+
     #[arg(long, help = "Use plaintext logging instead of structured logging")]
     plaintext_log: bool,
 }
@@ -67,7 +79,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     {
-        let subscriber = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
+        // `from_default_env` alone would log errors only when RUST_LOG is unset.
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
         if args.plaintext_log {
             subscriber.init();
         } else {
@@ -83,21 +97,32 @@ async fn main() -> anyhow::Result<()> {
     let controller_api = args.controller_api || !any_api;
     let identity_api = args.identity_api || !any_api;
 
+    if args.allowed_url_prefixes.is_empty() {
+        warn!("--allowed-url-prefix is not set: any storage URL in a volume ID will be mounted");
+    }
+    // Shared so that mounting is serialized even when several APIs run in this process.
+    let mounter =
+        Arc::new(MountManager::default().with_allowed_prefixes(args.allowed_url_prefixes));
+
     let node = if node_api {
         Some(NodeServer::new(LoopCsiNode::new(
-            NodeOperator::new(args.base_directory.clone()).await?,
+            NodeOperator::new(args.base_directory.clone(), mounter.clone()).await?,
         )))
     } else {
         None
     };
     let controller = if controller_api {
         Some(ControllerServer::new(LoopCsiController::new(
-            ControllerOperator::new(args.default_size, args.base_directory).await?,
+            ControllerOperator::new(args.default_size, args.base_directory, mounter).await?,
         )))
     } else {
         None
     };
-    let identity = identity_api.then(|| IdentityServer::new(identity::NfsLoopCsiIdentity {}));
+    let identity = identity_api.then(|| {
+        IdentityServer::new(identity::LoopCsiIdentity {
+            controller_service: controller_api,
+        })
+    });
 
     let router = Server::builder()
         .add_optional_service(node)
@@ -110,15 +135,30 @@ async fn main() -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        // A socket left behind by a crashed run would make bind fail with EADDRINUSE.
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                tokio::fs::remove_file(path).await?
+            }
+            Ok(_) => anyhow::bail!("{} exists and is not a socket", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let listener = UnixListener::bind(path)?;
         info!(listen = %args.listen, "CSI gRPC server listening");
         let result = router
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown_signal())
             .await;
-        tokio::fs::remove_file(path).await?;
+        // Report the server's own result even if the socket file is already gone.
+        let _ = tokio::fs::remove_file(path).await;
         result?;
     } else if let Some(address) = args.listen.strip_prefix("tcp://") {
         let address: SocketAddr = address.parse()?;
+        if !address.ip().is_loopback() {
+            warn!(
+                "the gRPC API has no authentication or TLS; do not expose it beyond trusted hosts"
+            );
+        }
         info!(listen = %args.listen, "CSI gRPC server listening");
         router
             .serve_with_shutdown(address, shutdown_signal())

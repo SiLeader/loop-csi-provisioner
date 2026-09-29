@@ -1,6 +1,8 @@
 mod error;
 pub(crate) mod operator;
 
+use crate::capability::supported_capability;
+use crate::controller::error::ControllerError;
 use crate::controller::operator::ControllerOperator;
 use crate::proto::csi::v1::controller_server::Controller;
 use crate::proto::csi::v1::{
@@ -16,7 +18,7 @@ use crate::proto::csi::v1::{
     DeleteVolumeRequest, DeleteVolumeResponse, GetCapacityRequest, GetCapacityResponse,
     GetSnapshotRequest, GetSnapshotResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
-    ValidateVolumeCapabilitiesResponse, Volume, VolumeCapability, controller_service_capability,
+    ValidateVolumeCapabilitiesResponse, Volume, controller_service_capability,
 };
 use crate::volume_id::valid_volume_name;
 use std::collections::HashMap;
@@ -30,19 +32,6 @@ impl LoopCsiController {
     pub fn new(operator: ControllerOperator) -> Self {
         Self { operator }
     }
-}
-
-fn supported_capability(capability: &VolumeCapability) -> bool {
-    use crate::proto::csi::v1::volume_capability::{AccessType, access_mode::Mode};
-    let mount_ok = matches!(&capability.access_type, Some(AccessType::Mount(mount))
-        if (mount.fs_type.is_empty() || mount.fs_type == "ext4") && mount.mount_flags.is_empty() && mount.volume_mount_group.is_empty());
-    let mode_ok = capability.access_mode.as_ref().is_some_and(|mode| {
-        matches!(
-            Mode::try_from(mode.mode),
-            Ok(Mode::SingleNodeWriter | Mode::SingleNodeReaderOnly)
-        )
-    });
-    mount_ok && mode_ok
 }
 
 #[async_trait]
@@ -63,6 +52,11 @@ impl Controller for LoopCsiController {
         {
             return Err(Status::invalid_argument(
                 "Only ext4 mount volumes with single-node access are supported",
+            ));
+        }
+        if request.volume_content_source.is_some() {
+            return Err(Status::invalid_argument(
+                "Creating volumes from snapshots or other volumes is not supported",
             ));
         }
         if let Some(range) = &request.capacity_range {
@@ -113,7 +107,15 @@ impl Controller for LoopCsiController {
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let request = request.into_inner();
-        self.operator.delete_volume(&request.volume_id).await?;
+        if request.volume_id.is_empty() {
+            return Err(Status::invalid_argument("Missing volume ID"));
+        }
+        match self.operator.delete_volume(&request.volume_id).await {
+            Ok(()) => {}
+            // An ID this driver cannot have issued refers to no volume, which counts as deleted.
+            Err(ControllerError::VolumeIdParse) => {}
+            Err(e) => return Err(e.into()),
+        }
 
         Ok(Response::new(DeleteVolumeResponse {}))
     }
@@ -123,8 +125,20 @@ impl Controller for LoopCsiController {
         request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
         let request = request.into_inner();
+        if request.volume_id.is_empty() {
+            return Err(Status::invalid_argument("Missing volume ID"));
+        }
         if request.node_id.is_empty() {
             return Err(Status::invalid_argument("Missing node ID"));
+        }
+        match &request.volume_capability {
+            None => return Err(Status::invalid_argument("Missing volume capability")),
+            Some(capability) if !supported_capability(capability) => {
+                return Err(Status::invalid_argument(
+                    "Only ext4 mount volumes with single-node access are supported",
+                ));
+            }
+            Some(_) => {}
         }
         self.operator
             .publish_volume(&request.volume_id, &request.node_id)

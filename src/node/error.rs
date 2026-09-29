@@ -18,6 +18,18 @@ pub(crate) enum NodeError {
     #[error("Only ext4 filesystems are supported")]
     UnsupportedFilesystem,
 
+    #[error("Volume {0} not found")]
+    NotFound(String),
+
+    #[error("Volume {0} is not staged")]
+    NotStaged(String),
+
+    #[error("Volume is not staged at {0}")]
+    NotStagedAt(String),
+
+    #[error("Device {0} holds data that is not a supported filesystem; refusing to format it")]
+    NotBlank(String),
+
     #[error(transparent)]
     Fs(#[from] FsError),
 }
@@ -37,13 +49,29 @@ impl From<NodeError> for tonic::Status {
             NodeError::CommandFailure { code, message } => {
                 tonic::Status::internal(format!("Command failed with code {}: {}", code, message))
             }
-            NodeError::Mount(e) => tonic::Status::internal(format!("Mount error: {}", e)),
             NodeError::VolumeIdParse => {
                 tonic::Status::invalid_argument("Failed to parse volume ID")
             }
             NodeError::UnsupportedFilesystem => {
                 tonic::Status::failed_precondition("Only ext4 filesystems are supported")
             }
+            NodeError::NotFound(volume_id) => {
+                tonic::Status::not_found(format!("Volume {} not found", volume_id))
+            }
+            NodeError::NotStaged(volume_id) => {
+                tonic::Status::failed_precondition(format!("Volume {} is not staged", volume_id))
+            }
+            NodeError::NotStagedAt(path) => {
+                tonic::Status::failed_precondition(format!("Volume is not staged at {}", path))
+            }
+            NodeError::NotBlank(device) => tonic::Status::failed_precondition(format!(
+                "Device {} holds data that is not a supported filesystem; refusing to format it",
+                device
+            )),
+            NodeError::Mount(crate::mount::MountError::UrlNotAllowed(url)) => {
+                tonic::Status::permission_denied(format!("Storage URL {} is not allowed", url))
+            }
+            NodeError::Mount(e) => tonic::Status::internal(format!("Mount error: {}", e)),
             NodeError::Fs(e) => tonic::Status::internal(format!("Fs error: {}", e)),
         }
     }

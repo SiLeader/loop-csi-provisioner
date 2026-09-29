@@ -19,6 +19,11 @@ FROM debian:trixie-slim
 LABEL org.opencontainers.image.url="https://github.com/SiLeader/loop-csi-provisioner" \
       org.opencontainers.image.licenses="Apache-2.0"
 
+# mount + nfs-common: NFS mounts (mount.nfs); e2fsprogs: mkfs.ext4 and resize2fs
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends mount nfs-common e2fsprogs && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /loop-csi-provisioner /usr/sbin/loop-csi-provisioner
 
 CMD ["/usr/sbin/loop-csi-provisioner"]

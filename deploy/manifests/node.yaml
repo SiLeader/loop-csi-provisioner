@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: loop-csi-node
+  namespace: loop-csi
+spec:
+  selector:
+    matchLabels:
+      app: loop-csi-node
+  template:
+    metadata:
+      labels:
+        app: loop-csi-node
+    spec:
+      containers:
+        - name: driver
+          image: ghcr.io/sileader/loop-csi-provisioner:latest
+          args:
+            - --node-api
+            - --identity-api
+            - --listen=unix:///csi/csi.sock
+            - --base-directory=/var/lib/loop-csi-provisioner
+            # Replace with the storage URL(s) used by your StorageClasses.
+            - --allowed-url-prefix=nfs://127.0.0.1/share
+          env:
+            # Must match the node name the attacher sees, since ControllerPublish records it.
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            # Needs loop devices and mount(2).
+            privileged: true
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: kubelet
+              mountPath: /var/lib/kubelet
+              # Staging and publish mounts must appear in the host's mount namespace.
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+            - name: base
+              mountPath: /var/lib/loop-csi-provisioner
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/loop-csi-provisioner/csi.sock
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: registration
+              mountPath: /registration
+      volumes:
+        - name: socket
+          hostPath:
+            path: /var/lib/kubelet/plugins/loop-csi-provisioner
+            type: DirectoryOrCreate
+        - name: kubelet
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: registration
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: base
+          emptyDir: {}

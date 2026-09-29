@@ -1,24 +1,29 @@
 use crate::filesystem::{Filesystem, FilesystemManager};
+use crate::lock::KeyedLocks;
 use crate::mount::MountManager;
 use crate::node::error::NodeError;
 use crate::syscall::{MountOptions, MountSource, Syscall};
 use crate::volume_id::{VOLUME_DIR, parse_volume_id};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::warn;
 
 pub(crate) struct NodeOperator {
     base_directory: String,
-    mounter: MountManager,
+    mounter: Arc<MountManager>,
     syscall: Syscall,
     fs: FilesystemManager,
+    locks: KeyedLocks,
 }
 
 impl NodeOperator {
-    pub async fn new(base_directory: String) -> std::io::Result<Self> {
+    pub async fn new(base_directory: String, mounter: Arc<MountManager>) -> std::io::Result<Self> {
         Ok(Self {
             base_directory,
-            mounter: MountManager::default(),
+            mounter,
             syscall: Syscall::default(),
             fs: FilesystemManager::default(),
+            locks: KeyedLocks::default(),
         })
     }
 
@@ -30,15 +35,25 @@ impl NodeOperator {
         Ok(storage_base_directory.join(format!("{}.img", volume_id)))
     }
 
-    async fn find_loop_device(&self, volume_id: &str) -> Result<String, NodeError> {
-        let file_name = self
-            .volume_file_path(volume_id)
-            .await?
-            .to_string_lossy()
-            .to_string();
-        let loop_dev = self.syscall.find_loop(&file_name).await?;
+    /// Returns the loop device already attached to the volume's image, if any.
+    async fn attached_loop_device(&self, volume_id: &str) -> Result<Option<String>, NodeError> {
+        let path = self.volume_file_path(volume_id).await?;
+        if !tokio::fs::try_exists(&path).await? {
+            return Err(NodeError::NotFound(volume_id.to_string()));
+        }
+        let device = self.syscall.resolve_attached_loop_device(&path).await?;
+        Ok(device.map(|d| d.to_string_lossy().to_string()))
+    }
 
-        Ok(loop_dev.to_string_lossy().to_string())
+    /// Returns the loop device for the volume, attaching the image if needed.
+    /// The flag tells whether this call attached it.
+    async fn ensure_loop_device(&self, volume_id: &str) -> Result<(String, bool), NodeError> {
+        if let Some(device) = self.attached_loop_device(volume_id).await? {
+            return Ok((device, false));
+        }
+        let path = self.volume_file_path(volume_id).await?;
+        let device = self.syscall.find_loop(&path).await?;
+        Ok((device.to_string_lossy().to_string(), true))
     }
 
     pub async fn stage_volume(
@@ -46,25 +61,51 @@ impl NodeOperator {
         volume_id: &str,
         staging_target_path: &str,
     ) -> Result<(), NodeError> {
+        let _guard = self.locks.lock(volume_id).await;
+
         if self.is_mount_point(staging_target_path).await? {
             return Ok(());
         }
         tokio::fs::create_dir_all(staging_target_path).await?;
-        let loop_device = self.find_loop_device(volume_id).await?;
+        let (loop_device, newly_attached) = self.ensure_loop_device(volume_id).await?;
 
-        let fs = match self.syscall.detect_filesystem(&loop_device).await? {
-            None => self.fs.create(Filesystem::Ext4, &loop_device).await?,
-            Some(fs) => {
-                if fs != Filesystem::Ext4 {
-                    return Err(NodeError::UnsupportedFilesystem);
+        match self
+            .format_and_mount(&loop_device, staging_target_path)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Do not leak a device this call attached; a retry attaches a fresh one.
+                if newly_attached
+                    && let Err(detach_err) = self.syscall.detach_loop(&loop_device).await
+                {
+                    warn!(device = %loop_device, error = %detach_err, "failed to detach loop device after failed stage");
                 }
-                fs
+                Err(e)
             }
+        }
+    }
+
+    async fn format_and_mount(
+        &self,
+        loop_device: &str,
+        staging_target_path: &str,
+    ) -> Result<(), NodeError> {
+        let fs = match self.syscall.detect_filesystem(loop_device).await? {
+            None => {
+                // Only format a device that is entirely unused; anything else may be someone's data.
+                if !self.syscall.is_blank(loop_device).await? {
+                    return Err(NodeError::NotBlank(loop_device.to_string()));
+                }
+                self.fs.create(Filesystem::Ext4, loop_device).await?
+            }
+            Some(Filesystem::Ext4) => Filesystem::Ext4,
+            Some(_) => return Err(NodeError::UnsupportedFilesystem),
         };
 
         self.syscall
             .mount(
-                MountSource::fs(fs, &loop_device),
+                MountSource::fs(fs, loop_device),
                 staging_target_path,
                 MountOptions::default(),
             )
@@ -78,23 +119,35 @@ impl NodeOperator {
         target_path: &str,
         readonly: bool,
     ) -> Result<(), NodeError> {
-        if self.is_mount_point(target_path).await? {
-            return Ok(());
+        let _guard = self.locks.lock(target_path).await;
+
+        if !self.is_mount_point(staging_target_path).await? {
+            // Bind mounting an unstaged directory would silently expose an empty directory.
+            return Err(NodeError::NotStagedAt(staging_target_path.to_string()));
         }
         tokio::fs::create_dir_all(target_path).await?;
 
         let src = MountSource::bind(staging_target_path);
+        let remount_readonly = MountOptions::default().remount(true).readonly(true);
+        if self.is_mount_point(target_path).await? {
+            // A previous attempt may have bound the volume but failed to make it read-only.
+            if readonly && !self.syscall.is_readonly(target_path).await? {
+                self.syscall
+                    .mount(src, target_path, remount_readonly)
+                    .await?;
+            }
+            return Ok(());
+        }
+
         self.syscall
             .mount(src.clone(), target_path, MountOptions::default())
             .await?;
-        if readonly {
-            self.syscall
-                .mount(
-                    src,
-                    target_path,
-                    MountOptions::default().remount(true).readonly(true),
-                )
-                .await?;
+        if readonly && let Err(e) = self.syscall.mount(src, target_path, remount_readonly).await {
+            // Never leave a writable mount behind for a read-only request.
+            if let Err(unmount_err) = self.syscall.unmount(target_path).await {
+                warn!(target = %target_path, error = %unmount_err, "failed to unmount after failed read-only remount");
+            }
+            return Err(e.into());
         }
         Ok(())
     }
@@ -105,9 +158,12 @@ impl NodeOperator {
     }
 
     pub async fn unpublish_volume(&self, target_path: &str) -> Result<(), NodeError> {
+        let _guard = self.locks.lock(target_path).await;
+
         if self.is_mount_point(target_path).await? {
             self.syscall.unmount(target_path).await?;
         }
+        remove_dir_best_effort(target_path).await;
         Ok(())
     }
 
@@ -116,34 +172,60 @@ impl NodeOperator {
         volume_id: &str,
         staging_target_path: &str,
     ) -> Result<(), NodeError> {
+        let _guard = self.locks.lock(volume_id).await;
+
+        // While staged, the mount itself identifies the loop device, so unstaging does not
+        // depend on the backing storage (e.g. an unreachable NFS server) being available.
+        let mut device = None;
         if self.is_mount_point(staging_target_path).await? {
+            device = self
+                .syscall
+                .loop_device_of_mount(staging_target_path)
+                .await?;
             self.syscall.unmount(staging_target_path).await?;
         }
-        let path = self.volume_file_path(volume_id).await?;
-        let device = self.syscall.resolve_attached_loop_device(&path).await?;
+        let device = match device {
+            Some(device) => Some(device.to_string_lossy().to_string()),
+            None => match self.attached_loop_device(volume_id).await {
+                Ok(device) => device,
+                Err(NodeError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            },
+        };
         if let Some(device) = device {
             self.syscall.detach_loop(&device).await?;
         }
+        remove_dir_best_effort(staging_target_path).await;
         Ok(())
     }
 
     pub async fn expand_volume(&self, volume_id: &str) -> Result<i64, NodeError> {
-        let path = self.volume_file_path(volume_id).await?;
-        if !tokio::fs::try_exists(&path).await? {
-            return Err(NodeError::CommandFailure {
-                code: -1,
-                message: format!("Volume {} not found", volume_id),
-            });
-        }
+        let _guard = self.locks.lock(volume_id).await;
 
-        let loop_device = self.find_loop_device(volume_id).await?;
+        // The volume is mounted through an existing loop device; that device (not a new one)
+        // must learn about the new file size before the filesystem is grown.
+        let loop_device = self
+            .attached_loop_device(volume_id)
+            .await?
+            .ok_or_else(|| NodeError::NotStaged(volume_id.to_string()))?;
         self.syscall
             .apply_loop_device_capacity(&loop_device)
             .await?;
 
         self.fs.resize(Filesystem::Ext4, &loop_device).await?;
 
+        let path = self.volume_file_path(volume_id).await?;
         let metadata = tokio::fs::metadata(&path).await?;
         Ok(metadata.len() as i64)
+    }
+}
+
+/// Removes the directory created for a (un)staged or (un)published path.
+/// CSI requires the plugin to delete what it created, but a leftover must not fail the RPC.
+async fn remove_dir_best_effort(path: &str) {
+    match tokio::fs::remove_dir(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %path, error = %e, "failed to remove directory"),
     }
 }

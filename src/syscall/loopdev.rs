@@ -1,18 +1,57 @@
 use crate::syscall::Syscall;
-use rustix::fs::{Mode, OFlags, open, stat};
-use rustix::ioctl::{Getter, NoArg, Setter, ioctl};
+use rustix::fs::{Mode, OFlags, major, minor, open, stat};
+use rustix::io::Errno;
+use rustix::ioctl::{Getter, Ioctl, IoctlOutput, NoArg, Opcode, Setter, ioctl};
+use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 impl Syscall {
+    /// Attaches `file` to a free loop device and returns the device path.
+    ///
+    /// A free device number can be taken by another process between `LOOP_CTL_GET_FREE`
+    /// and `LOOP_CONFIGURE`, so `EBUSY` is retried with a fresh number.
     pub async fn find_loop(&self, file: impl AsRef<Path>) -> std::io::Result<PathBuf> {
         let file = file.as_ref().to_path_buf();
 
         Self::spawn(move || {
+            let image_fd = open(
+                file.as_path(),
+                OFlags::RDWR | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
             let lc = LoopControl::open()?;
-            let ld = lc.next_free()?;
-            ld.attach_file(file.as_ref())?;
-            Ok(ld.into_path())
+            let mut attempt = 1;
+            loop {
+                let ld = lc.next_free()?;
+                match ld.attach_file(&image_fd) {
+                    Ok(()) => return Ok(ld.into_path()),
+                    Err(e)
+                        if e.raw_os_error() == Some(Errno::BUSY.raw_os_error())
+                            && attempt < ATTACH_ATTEMPTS =>
+                    {
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+    }
+
+    /// Returns the loop device backing the filesystem mounted at `path`, if any.
+    pub async fn loop_device_of_mount(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let path = path.as_ref().to_path_buf();
+        Self::spawn(move || {
+            let dev = stat(path.as_path())?.st_dev;
+            if major(dev) == LOOP_MAJOR {
+                Ok(Some(PathBuf::from(format!("/dev/loop{}", minor(dev)))))
+            } else {
+                Ok(None)
+            }
         })
         .await
     }
@@ -51,7 +90,8 @@ async fn get_attached_loop_device(
 ) -> std::io::Result<Option<PathBuf>> {
     let dev_fs = Path::new("/dev");
 
-    let image_stat = stat(image_file.as_ref())?;
+    let image_file = image_file.as_ref().to_path_buf();
+    let image_stat = Syscall::spawn(move || Ok(stat(image_file.as_path())?)).await?;
 
     let mut dir = tokio::fs::read_dir("/sys/block").await?;
     while let Some(entry) = dir.next_entry().await? {
@@ -96,13 +136,17 @@ struct LoopDevice {
     file: OwnedFd,
 }
 
-const LOOP_CTL_GET_FREE: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_CTL_GET_FREE;
-const LOOP_CONFIGURE: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_CONFIGURE;
-const LOOP_CLR_FD: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_CLR_FD;
-const LOOP_SET_CAPACITY: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_SET_CAPACITY;
-const LOOP_GET_STATUS64: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_GET_STATUS64;
+const LOOP_CTL_GET_FREE: Opcode = linux_raw_sys::loop_device::LOOP_CTL_GET_FREE;
+const LOOP_CONFIGURE: Opcode = linux_raw_sys::loop_device::LOOP_CONFIGURE;
+const LOOP_CLR_FD: Opcode = linux_raw_sys::loop_device::LOOP_CLR_FD;
+const LOOP_SET_CAPACITY: Opcode = linux_raw_sys::loop_device::LOOP_SET_CAPACITY;
+const LOOP_GET_STATUS64: Opcode = linux_raw_sys::loop_device::LOOP_GET_STATUS64;
 
-const LO_FLAGS_AUTOCLEAR: u32 = linux_raw_sys::loop_device::LO_FLAGS_AUTOCLEAR as u32;
+/// Major number of loop block devices.
+const LOOP_MAJOR: u32 = 7;
+
+/// How many times attaching is retried when a concurrent caller grabs the same free device.
+const ATTACH_ATTEMPTS: u32 = 16;
 
 #[repr(C)]
 struct LoopInfo64 {
@@ -130,10 +174,18 @@ struct LoopConfig {
     reserved: [u64; 8],
 }
 
+struct RetValue<const OPCODE: Opcode> {}
+
+impl<const OPCODE: Opcode> RetValue<OPCODE> {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
 impl LoopControl {
     fn open() -> std::io::Result<Self> {
         let file = open(
-            "/dev/loop-device",
+            "/dev/loop-control",
             OFlags::RDWR | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
@@ -142,7 +194,7 @@ impl LoopControl {
 
     fn next_free(&self) -> std::io::Result<LoopDevice> {
         let num = unsafe {
-            let ctl = Getter::<LOOP_CTL_GET_FREE, i32>::new();
+            let ctl = RetValue::<LOOP_CTL_GET_FREE>::new();
             ioctl(&self.file, ctl)?
         };
         if num < 0 {
@@ -163,16 +215,10 @@ impl LoopDevice {
         })
     }
 
-    fn attach_file(&self, file: &Path) -> std::io::Result<()> {
-        let image_fd = open(file, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())?;
-
+    fn attach_file(&self, image_fd: &OwnedFd) -> std::io::Result<()> {
         let config = LoopConfig {
             fd: image_fd.as_raw_fd() as u32,
             block_size: 0,
-            info: LoopInfo64 {
-                lo_flags: LO_FLAGS_AUTOCLEAR,
-                ..Default::default()
-            },
             ..Default::default()
         };
 
@@ -225,5 +271,25 @@ impl Default for LoopInfo64 {
             lo_encrypt_key: [0u8; 32],
             lo_init: [0u64; 2],
         }
+    }
+}
+
+unsafe impl<const OPCODE: Opcode> Ioctl for RetValue<OPCODE> {
+    type Output = i32;
+    const IS_MUTATING: bool = false;
+
+    fn opcode(&self) -> Opcode {
+        OPCODE
+    }
+
+    fn as_ptr(&mut self) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    unsafe fn output_from_ptr(
+        out: IoctlOutput,
+        _extract_output: *mut c_void,
+    ) -> rustix::io::Result<Self::Output> {
+        Ok(out)
     }
 }

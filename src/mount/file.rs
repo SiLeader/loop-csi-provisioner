@@ -1,5 +1,5 @@
-use crate::mount::Mounter;
 use crate::mount::error::MountError;
+use crate::mount::{Mounter, encode_component};
 use tonic::async_trait;
 use tonic::transport::Uri;
 
@@ -12,13 +12,11 @@ impl Mounter for FileMounter {
     }
 
     fn mount_point(&self, source: &Uri, base: &str) -> Result<String, MountError> {
-        let path = source
-            .path()
-            .replace("/", "-")
-            .trim_matches('-')
-            .to_string();
-        let mount_point = format!("{}/{}", base, path);
-        Ok(mount_point)
+        Ok(format!(
+            "{}/file-{}",
+            base,
+            encode_component(source.path())?
+        ))
     }
 
     async fn mount(&self, source: &Uri, mount_point: &str) -> Result<(), MountError> {
@@ -42,5 +40,55 @@ impl Mounter for FileMounter {
             Err(e) => return Err(e.into()),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn similar_paths_get_distinct_mount_points() {
+        let m = FileMounter;
+        let a = m
+            .mount_point(&Uri::from_str("file://localhost/a/b").unwrap(), "/base")
+            .unwrap();
+        let b = m
+            .mount_point(&Uri::from_str("file://localhost/a-b").unwrap(), "/base")
+            .unwrap();
+        assert_ne!(a, b);
+        assert!(!a["/base/".len()..].contains('/'));
+    }
+
+    #[tokio::test]
+    async fn creates_and_reuses_symlink_and_rejects_conflicts() {
+        let root = std::env::temp_dir().join(format!("loop-csi-file-{}", std::process::id()));
+        let data = root.join("data");
+        let other = root.join("other");
+        tokio::fs::create_dir_all(&data).await.unwrap();
+        tokio::fs::create_dir_all(&other).await.unwrap();
+        let link = root.join("mounts/link");
+
+        let uri = Uri::from_str(&format!("file://localhost{}", data.display())).unwrap();
+        let m = FileMounter;
+        m.mount(&uri, link.to_str().unwrap()).await.unwrap();
+        m.mount(&uri, link.to_str().unwrap()).await.unwrap();
+        assert_eq!(tokio::fs::read_link(&link).await.unwrap(), data);
+
+        let other_uri = Uri::from_str(&format!("file://localhost{}", other.display())).unwrap();
+        assert!(matches!(
+            m.mount(&other_uri, link.to_str().unwrap()).await,
+            Err(MountError::InvalidFilePath(_))
+        ));
+        assert!(matches!(
+            m.mount(
+                &Uri::from_str("file://localhost/definitely/missing").unwrap(),
+                link.to_str().unwrap()
+            )
+            .await,
+            Err(MountError::InvalidFilePath(_))
+        ));
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

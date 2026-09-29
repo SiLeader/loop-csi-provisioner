@@ -21,6 +21,12 @@ pub(crate) enum MountError {
     #[error("Invalid local storage path: {0}")]
     InvalidFilePath(String),
 
+    #[error("Invalid storage URL: {0}")]
+    InvalidUrl(String),
+
+    #[error("Storage URL is not allowed by --allowed-url-prefix: {0}")]
+    UrlNotAllowed(String),
+
     #[error("Command failed with code {code}: {message}")]
     CommandFailure { code: i32, message: String },
 }

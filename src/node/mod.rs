@@ -1,6 +1,7 @@
 mod error;
 pub(crate) mod operator;
 
+use crate::capability::supported_capability;
 use crate::node::operator::NodeOperator;
 use crate::proto::csi::v1::node_server::Node;
 use crate::proto::csi::v1::{
@@ -11,7 +12,7 @@ use crate::proto::csi::v1::{
     NodePublishVolumeRequest, NodePublishVolumeResponse, NodeServiceCapability,
     NodeStageVolumeRequest, NodeStageVolumeResponse, NodeUnpublishVolumeRequest,
     NodeUnpublishVolumeResponse, NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
-    node_service_capability,
+    VolumeCapability, node_service_capability,
 };
 use tonic::{Request, Response, Status, async_trait};
 
@@ -25,6 +26,24 @@ impl LoopCsiNode {
     }
 }
 
+fn require(value: &str, name: &str) -> Result<(), Status> {
+    if value.is_empty() {
+        Err(Status::invalid_argument(format!("Missing {name}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_capability(capability: Option<&VolumeCapability>) -> Result<(), Status> {
+    match capability {
+        None => Err(Status::invalid_argument("Missing volume capability")),
+        Some(capability) if !supported_capability(capability) => Err(Status::invalid_argument(
+            "Only ext4 mount volumes with single-node access are supported",
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 #[async_trait]
 impl Node for LoopCsiNode {
     async fn node_stage_volume(
@@ -32,6 +51,9 @@ impl Node for LoopCsiNode {
         request: Request<NodeStageVolumeRequest>,
     ) -> Result<Response<NodeStageVolumeResponse>, Status> {
         let request = request.into_inner();
+        require(&request.volume_id, "volume ID")?;
+        require(&request.staging_target_path, "staging target path")?;
+        require_capability(request.volume_capability.as_ref())?;
 
         self.operator
             .stage_volume(&request.volume_id, &request.staging_target_path)
@@ -45,6 +67,8 @@ impl Node for LoopCsiNode {
         request: Request<NodeUnstageVolumeRequest>,
     ) -> Result<Response<NodeUnstageVolumeResponse>, Status> {
         let request = request.into_inner();
+        require(&request.volume_id, "volume ID")?;
+        require(&request.staging_target_path, "staging target path")?;
         self.operator
             .unstage_volume(&request.volume_id, &request.staging_target_path)
             .await?;
@@ -56,6 +80,10 @@ impl Node for LoopCsiNode {
         request: Request<NodePublishVolumeRequest>,
     ) -> Result<Response<NodePublishVolumeResponse>, Status> {
         let request = request.into_inner();
+        require(&request.volume_id, "volume ID")?;
+        require(&request.staging_target_path, "staging target path")?;
+        require(&request.target_path, "target path")?;
+        require_capability(request.volume_capability.as_ref())?;
 
         self.operator
             .publish_volume(
@@ -72,6 +100,8 @@ impl Node for LoopCsiNode {
         request: Request<NodeUnpublishVolumeRequest>,
     ) -> Result<Response<NodeUnpublishVolumeResponse>, Status> {
         let request = request.into_inner();
+        require(&request.volume_id, "volume ID")?;
+        require(&request.target_path, "target path")?;
         self.operator.unpublish_volume(&request.target_path).await?;
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }
@@ -108,6 +138,7 @@ impl Node for LoopCsiNode {
         request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
         let request = request.into_inner();
+        require(&request.volume_id, "volume ID")?;
 
         let capacity_bytes = self.operator.expand_volume(&request.volume_id).await?;
 
