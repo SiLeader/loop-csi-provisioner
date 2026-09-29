@@ -77,10 +77,11 @@ async fn get_attached_loop_device(
             Ok(Some(info))
         })
         .await?;
-        if let Some(info) = info {
-            if info.lo_device == image_stat.st_dev && info.lo_inode == image_stat.st_ino {
-                return Ok(Some(device_file));
-            }
+        if let Some(info) = info
+            && info.lo_device == image_stat.st_dev
+            && info.lo_inode == image_stat.st_ino
+        {
+            return Ok(Some(device_file));
         }
     }
     Ok(None)
@@ -121,6 +122,7 @@ struct LoopInfo64 {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct LoopConfig {
     fd: u32,
     block_size: u32,
@@ -222,17 +224,6 @@ impl Default for LoopInfo64 {
             lo_crypt_name: [0u8; 64],
             lo_encrypt_key: [0u8; 32],
             lo_init: [0u64; 2],
-        }
-    }
-}
-
-impl Default for LoopConfig {
-    fn default() -> Self {
-        Self {
-            fd: 0,
-            block_size: 0,
-            info: Default::default(),
-            reserved: [0u64; 8],
         }
     }
 }

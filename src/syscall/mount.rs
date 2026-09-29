@@ -17,7 +17,7 @@ pub(crate) struct FsMountSource {
     path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MountOptions {
     readonly: bool,
     remount: bool,
@@ -43,15 +43,6 @@ impl MountSource {
 impl FsMountSource {
     fn path(&self) -> &Path {
         &self.path
-    }
-}
-
-impl Default for MountOptions {
-    fn default() -> Self {
-        Self {
-            readonly: false,
-            remount: false,
-        }
     }
 }
 
