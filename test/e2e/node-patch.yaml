@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: loop-csi-node
+  namespace: loop-csi
+spec:
+  template:
+    spec:
+      containers:
+        - name: driver
+          args:
+            - --node-api
+            - --identity-api
+            - --listen=unix:///csi/csi.sock
+            - --base-directory=/var/lib/loop-csi-provisioner
+            - --allowed-url-prefix=file:///var/lib/loop-csi-storage
+            - --plaintext-log
+          volumeMounts:
+            - name: storage
+              mountPath: /var/lib/loop-csi-storage
+      volumes:
+        - name: storage
+          hostPath:
+            path: /var/lib/loop-csi-storage
+            type: Directory

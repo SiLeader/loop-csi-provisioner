@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forbidden
+spec:
+  storageClassName: loop-e2e-forbidden
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 64Mi

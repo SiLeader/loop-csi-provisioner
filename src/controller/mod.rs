@@ -4,6 +4,7 @@ pub(crate) mod operator;
 use crate::capability::supported_capability;
 use crate::controller::error::ControllerError;
 use crate::controller::operator::ControllerOperator;
+use crate::proto::csi::v1::CapacityRange;
 use crate::proto::csi::v1::controller_server::Controller;
 use crate::proto::csi::v1::{
     ControllerExpandVolumeRequest, ControllerExpandVolumeResponse,
@@ -20,18 +21,36 @@ use crate::proto::csi::v1::{
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
     ValidateVolumeCapabilitiesResponse, Volume, controller_service_capability,
 };
+use crate::task::run_to_completion;
 use crate::volume_id::valid_volume_name;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tonic::{Request, Response, Status, async_trait};
 
 pub(crate) struct LoopCsiController {
-    operator: ControllerOperator,
+    operator: Arc<ControllerOperator>,
 }
 
 impl LoopCsiController {
     pub fn new(operator: ControllerOperator) -> Self {
-        Self { operator }
+        Self {
+            operator: Arc::new(operator),
+        }
     }
+}
+
+/// Returns `(required_bytes, limit_bytes)`, with 0 meaning unspecified as in CSI.
+fn capacity_range(range: Option<&CapacityRange>) -> Result<(i64, i64), Status> {
+    let Some(range) = range else {
+        return Ok((0, 0));
+    };
+    if range.required_bytes < 0
+        || range.limit_bytes < 0
+        || (range.limit_bytes > 0 && range.required_bytes > range.limit_bytes)
+    {
+        return Err(Status::invalid_argument("Invalid capacity range"));
+    }
+    Ok((range.required_bytes, range.limit_bytes))
 }
 
 #[async_trait]
@@ -59,38 +78,16 @@ impl Controller for LoopCsiController {
                 "Creating volumes from snapshots or other volumes is not supported",
             ));
         }
-        if let Some(range) = &request.capacity_range {
-            if range.required_bytes < 0
-                || range.limit_bytes < 0
-                || (range.limit_bytes > 0 && range.required_bytes > range.limit_bytes)
-            {
-                return Err(Status::invalid_argument("Invalid capacity range"));
-            }
-            if range.limit_bytes > 0
-                && range.required_bytes == 0
-                && self.operator.default_size() > range.limit_bytes
-            {
-                return Err(Status::out_of_range(
-                    "Default volume size exceeds capacity limit",
-                ));
-            }
-        }
+        let (required, limit) = capacity_range(request.capacity_range.as_ref())?;
         let volume_id = format!("{}:{}", url, request.name);
-        let capacity_bytes = self
-            .operator
-            .create_volume(
-                &volume_id,
-                request.capacity_range.as_ref().map(|c| c.required_bytes),
-                &url,
-            )
-            .await?;
-        if request
-            .capacity_range
-            .as_ref()
-            .is_some_and(|range| range.limit_bytes > 0 && capacity_bytes > range.limit_bytes)
-        {
-            return Err(Status::out_of_range("Volume exceeds capacity limit"));
-        }
+        let operator = self.operator.clone();
+        let (id, storage_url) = (volume_id.clone(), url.clone());
+        let capacity_bytes = run_to_completion("CreateVolume", async move {
+            operator
+                .create_volume(&id, required, limit, &storage_url)
+                .await
+        })
+        .await?;
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(Volume {
@@ -110,12 +107,15 @@ impl Controller for LoopCsiController {
         if request.volume_id.is_empty() {
             return Err(Status::invalid_argument("Missing volume ID"));
         }
-        match self.operator.delete_volume(&request.volume_id).await {
-            Ok(()) => {}
-            // An ID this driver cannot have issued refers to no volume, which counts as deleted.
-            Err(ControllerError::VolumeIdParse) => {}
-            Err(e) => return Err(e.into()),
-        }
+        let operator = self.operator.clone();
+        run_to_completion("DeleteVolume", async move {
+            match operator.delete_volume(&request.volume_id).await {
+                // An ID this driver cannot have issued refers to no volume, which counts as deleted.
+                Ok(()) | Err(ControllerError::VolumeIdParse) => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+        .await?;
 
         Ok(Response::new(DeleteVolumeResponse {}))
     }
@@ -140,9 +140,13 @@ impl Controller for LoopCsiController {
             }
             Some(_) => {}
         }
-        self.operator
-            .publish_volume(&request.volume_id, &request.node_id)
-            .await?;
+        let operator = self.operator.clone();
+        run_to_completion("ControllerPublishVolume", async move {
+            operator
+                .publish_volume(&request.volume_id, &request.node_id)
+                .await
+        })
+        .await?;
 
         Ok(Response::new(ControllerPublishVolumeResponse {
             publish_context: Default::default(),
@@ -154,9 +158,13 @@ impl Controller for LoopCsiController {
         request: Request<ControllerUnpublishVolumeRequest>,
     ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
         let request = request.into_inner();
-        self.operator
-            .unpublish_volume(&request.volume_id, &request.node_id)
-            .await?;
+        let operator = self.operator.clone();
+        run_to_completion("ControllerUnpublishVolume", async move {
+            operator
+                .unpublish_volume(&request.volume_id, &request.node_id)
+                .await
+        })
+        .await?;
         Ok(Response::new(ControllerUnpublishVolumeResponse {}))
     }
 
@@ -165,24 +173,30 @@ impl Controller for LoopCsiController {
         request: Request<ValidateVolumeCapabilitiesRequest>,
     ) -> Result<Response<ValidateVolumeCapabilitiesResponse>, Status> {
         let request = request.into_inner();
-        self.operator.volume_size(&request.volume_id).await?;
+        if request.volume_id.is_empty() {
+            return Err(Status::invalid_argument("Missing volume ID"));
+        }
         if request.volume_capabilities.is_empty() {
             return Err(Status::invalid_argument("Missing volume capabilities"));
         }
-        let confirmed = request
-            .volume_capabilities
-            .iter()
-            .all(supported_capability)
-            .then_some(
+        self.operator.volume_size(&request.volume_id).await?;
+        if !request.volume_capabilities.iter().all(supported_capability) {
+            return Ok(Response::new(ValidateVolumeCapabilitiesResponse {
+                confirmed: None,
+                message: "Only ext4 mount volumes with SINGLE_NODE_WRITER or \
+                          SINGLE_NODE_READER_ONLY access and no mount flags are supported"
+                    .to_string(),
+            }));
+        }
+        Ok(Response::new(ValidateVolumeCapabilitiesResponse {
+            confirmed: Some(
                 crate::proto::csi::v1::validate_volume_capabilities_response::Confirmed {
                     volume_context: request.volume_context,
                     volume_capabilities: request.volume_capabilities,
                     parameters: request.parameters,
                     mutable_parameters: request.mutable_parameters,
                 },
-            );
-        Ok(Response::new(ValidateVolumeCapabilitiesResponse {
-            confirmed,
+            ),
             message: String::new(),
         }))
     }
@@ -275,27 +289,17 @@ impl Controller for LoopCsiController {
         request: Request<ControllerExpandVolumeRequest>,
     ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
         let request = request.into_inner();
-        let size = request.capacity_range.as_ref().map(|c| c.required_bytes);
-        if request.capacity_range.as_ref().is_some_and(|range| {
-            range.required_bytes < 0
-                || range.limit_bytes < 0
-                || (range.limit_bytes > 0 && range.required_bytes > range.limit_bytes)
-        }) {
-            return Err(Status::invalid_argument("Invalid capacity range"));
+        if request.volume_id.is_empty() {
+            return Err(Status::invalid_argument("Missing volume ID"));
         }
-        if request.capacity_range.as_ref().is_some_and(|range| {
-            range.limit_bytes > 0
-                && range.required_bytes == 0
-                && self.operator.default_size() > range.limit_bytes
-        }) {
-            return Err(Status::out_of_range(
-                "Default volume size exceeds capacity limit",
-            ));
-        }
-        let capacity_bytes = self
-            .operator
-            .expand_volume(&request.volume_id, size)
-            .await?;
+        let (required, limit) = capacity_range(request.capacity_range.as_ref())?;
+        let operator = self.operator.clone();
+        let capacity_bytes = run_to_completion("ControllerExpandVolume", async move {
+            operator
+                .expand_volume(&request.volume_id, required, limit)
+                .await
+        })
+        .await?;
         Ok(Response::new(ControllerExpandVolumeResponse {
             capacity_bytes,
             node_expansion_required: true,

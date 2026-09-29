@@ -3,14 +3,85 @@ name: Build and Push Container Image
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/sileader/loop-csi-provisioner
+
 jobs:
-  build-container:
+  # Each architecture builds natively on its own runner (no QEMU emulation) and pushes an
+  # untagged image by digest; the merge job then tags one multi-arch manifest list.
+  build:
     strategy:
       matrix:
-        runner:
-          - ubuntu-latest # x64
-          - ubuntu-24.04-arm # arm64
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare build metadata
+        id: prepare
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          version=$(grep -E '^version\s*=' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+          echo "Version extracted: v$version"
+          {
+            echo "version=v$version"
+            # github.event.head_commit is not set for workflow_dispatch.
+            echo "created=$(git log -1 --format=%cI)"
+            echo "arch=${PLATFORM#linux/}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.prepare.outputs.created }}
+            org.opencontainers.image.version=${{ steps.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ steps.prepare.outputs.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -21,8 +92,14 @@ jobs:
         id: extract_version
         run: |
           version=$(grep -E '^version\s*=' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
-          echo "Version extracted: v$version"
           echo "version=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -30,19 +107,26 @@ jobs:
       - name: Log in to ghcr.io
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          push: true
-          labels: |
-            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
-            org.opencontainers.image.version=${{ steps.extract_version.outputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/loop-csi-provisioner:latest
-            ghcr.io/${{ github.repository_owner }}/loop-csi-provisioner:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/loop-csi-provisioner:${{ steps.extract_version.outputs.version }}
+      - name: Create and push the multi-arch manifest list
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          VERSION: ${{ steps.extract_version.outputs.version }}
+        run: |
+          sources=()
+          for digest in *; do
+            sources+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" \
+            --tag "$IMAGE:$GITHUB_SHA" \
+            --tag "$IMAGE:$VERSION" \
+            "${sources[@]}"
+
+      - name: Inspect the manifest list
+        env:
+          VERSION: ${{ steps.extract_version.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"

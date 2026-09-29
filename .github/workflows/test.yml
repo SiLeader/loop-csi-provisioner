@@ -15,6 +15,9 @@ on:
       - labeled
       - unlabeled
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -146,3 +149,17 @@ jobs:
       - name: Check license compliance
         shell: bash
         run: cargo deny check
+
+  e2e:
+    # Runs the driver on a kind cluster (the runner image ships kind and kubectl).
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run end-to-end test on kind
+        shell: bash
+        run: test/e2e/run.sh

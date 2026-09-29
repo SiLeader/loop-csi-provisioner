@@ -15,6 +15,15 @@ pub(crate) fn supported_capability(capability: &VolumeCapability) -> bool {
     mount_ok && mode_ok
 }
 
+/// Returns true when the capability only allows reading the volume.
+pub(crate) fn is_read_only(capability: &VolumeCapability) -> bool {
+    use crate::proto::csi::v1::volume_capability::access_mode::Mode;
+    capability
+        .access_mode
+        .as_ref()
+        .is_some_and(|mode| Mode::try_from(mode.mode) == Ok(Mode::SingleNodeReaderOnly))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +60,11 @@ mod tests {
             Mode::MultiNodeMultiWriter
         )));
         assert!(!supported_capability(&VolumeCapability::default()));
+    }
+
+    #[test]
+    fn reader_only_mode_is_read_only() {
+        assert!(is_read_only(&capability("", Mode::SingleNodeReaderOnly)));
+        assert!(!is_read_only(&capability("", Mode::SingleNodeWriter)));
     }
 }

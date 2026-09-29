@@ -25,6 +25,16 @@ StorageClass の `url` パラメーターで保存先のディレクトリを指
 はボリューム単位のロックを持ちますが、同じ保存先を共有する複数の Controller プロセス間の調停はしないため、有効な Controller
 は一つだけにしてください。
 
+新しいボリュームは ext4 の Multi-Mount Protection（`mmp`）付きで初期化します。あるホストがボリュームをマウントしている間は、
+別のホストでのマウントをカーネルが拒否します（応答しなくなったがまだ動いているノードから Kubernetes が強制 detach した場合など）。
+正常にアンマウントされたボリュームはすぐにマウントできますが、そうでない場合（ほかで使用中、またはノードがクラッシュした場合）は、
+マウント前に MMP の間隔数回分（通常は数十秒）待ちます。以前のバージョンで初期化したボリュームは、アンマウントした状態のイメージに
+`tune2fs -O mmp` を実行するまでこの保護を受けません。ボリュームのサイズは 4 KiB 単位に切り上げます。
+
+保存先 URL はボリューム ID に含まれるため、ボリュームは作成時の URL に結び付きます。NFS サーバーのアドレスが変わっても、既存の
+PersistentVolume はそれに追従できません。NFS エクスポートは `mount.nfs` の既定のオプションでマウントします。クエリ文字列付きの URL
+は拒否するため、`nfsvers` などのオプションはまだ指定できません。
+
 対応するのは ext4 ファイルシステムボリュームと `SINGLE_NODE_WRITER` / `SINGLE_NODE_READER_ONLY` アクセスモードです。
 ブロックボリューム、ほかのファイルシステム、マウントフラグ、ボリュームマウントグループには対応していません。Node は新規ボリュームの
 初期化時に `mkfs.ext4`、拡張時に `resize2fs` を実行します。初期化するのは先頭 1 MiB がすべて 0 のデバイスだけで、それ以外で ext4
@@ -56,18 +66,25 @@ JSON 形式ではなくテキスト形式でログを出力します。ログレ
 `--allowed-url-prefix`（複数指定可）は、マウントを許可する保存先 URL を `/` 区切りの前方一致で制限します。例:
 `--allowed-url-prefix nfs://nfs.example.com/export`。URL はすべてのボリューム ID に含まれるため、本番では必ず指定してください。指定しないと、
 PersistentVolume や StorageClass を作成できる人が、任意の URL をドライバーにマウントさせられます。gRPC API には認証も TLS もないため、
-`tcp://` ではなく Unix ソケットを使ってください。Node API は `NODE_ID` をノード識別子として使い、設定されていない場合は
-`/etc/hostname` を参照します。全オプションは `--help` で確認できます。
+`tcp://` ではなく Unix ソケットを使ってください。Node API には `--node-id`（または `NODE_ID`）が必要で、CO がそのノードに
+使う名前（Kubernetes ではノード名）と一致させてください。全オプションは `--help` で確認できます。
 
 ## Kubernetes 対応状況
 
 [deploy/manifests](deploy/manifests) に、CSIDriver、RBAC、Controller の Deployment、Node の DaemonSet、
 [StorageClass の例](deploy/manifests/storageclass.yaml)（必須の `url` パラメーターと `fsType: ext4` を指定）を置いています。
-これらのマニフェストは実際のクラスターではまだ試していません。使用前に、イメージのタグ、`--allowed-url-prefix` の値、権限を確認してください。
+ドライバーは `kubectl apply -k deploy/manifests` で適用し、StorageClass は環境に合わせて編集してから適用してください。マニフェストは kind
+上では検証していますが（後述）、本番クラスターではまだ試していません。使用前に、イメージのタグ、`--allowed-url-prefix` の値、権限を確認してください。
 
 基本的な作成、公開、ステージング、拡張、公開解除、ステージング解除、削除を実装しました。スナップショット、一覧、ヘルスチェックなどのオプションの
 CSI RPC は `UNIMPLEMENTED` を返します。Node でのマウントには、ループデバイスを備えた特権付き Linux
-ホストが必要です。自動テストはローカルファイルのライフサイクルを対象としており、特権が必要なマウント処理や NFS は対象外です。
+ホストが必要です。
+
+単体テスト（`cargo test`）は Controller のローカルファイルのライフサイクルを対象とし、特権は不要です。E2E テスト
+[test/e2e/run.sh](test/e2e/run.sh) はイメージをビルドし、kind ノード上の `file://` 保存先を使って [kind](https://kind.sigs.k8s.io/)
+クラスターにマニフェストを適用します。そのうえで PVC の作成、書き込み、オンライン拡張、読み取り専用での再マウント、Multi-Mount Protection、
+削除までを確認します。Docker、kind、kubectl と、ループデバイスを使えるホストカーネルが必要です。`KEEP_CLUSTER=1` を指定すると、
+デバッグ用にクラスターを残します。NFS の保存先はまだ対象外です。
 
 ## ライセンス
 

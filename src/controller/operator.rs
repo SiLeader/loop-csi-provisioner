@@ -16,6 +16,10 @@ pub(crate) struct ControllerOperator {
     locks: KeyedLocks,
 }
 
+/// Volume sizes are rounded up to whole ext4 blocks, so the loop device and the filesystem
+/// cover the entire image and the reported capacity is what the volume can actually hold.
+const BLOCK_SIZE: u64 = 4096;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Metadata {
@@ -44,9 +48,6 @@ async fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 impl ControllerOperator {
-    pub fn default_size(&self) -> i64 {
-        self.default_size
-    }
     pub async fn new(
         default_size: i64,
         base_directory: String,
@@ -58,6 +59,25 @@ impl ControllerOperator {
             mounter,
             locks: KeyedLocks::default(),
         })
+    }
+
+    /// Returns the image size for a capacity range: `required` (or the default size when it
+    /// is 0) rounded up to [`BLOCK_SIZE`], which must not exceed a non-zero `limit`.
+    fn resolve_size(&self, required: i64, limit: i64) -> Result<i64, ControllerError> {
+        let wanted = if required > 0 {
+            required
+        } else {
+            self.default_size
+        };
+        let size = u64::try_from(wanted)
+            .ok()
+            .and_then(|size| size.checked_next_multiple_of(BLOCK_SIZE))
+            .and_then(|size| i64::try_from(size).ok())
+            .ok_or(ControllerError::ExceedsLimit(wanted, i64::MAX))?;
+        if limit > 0 && size > limit {
+            return Err(ControllerError::ExceedsLimit(size, limit));
+        }
+        Ok(size)
     }
 
     async fn volume_file_path(&self, volume_id: &str) -> Result<PathBuf, ControllerError> {
@@ -95,25 +115,26 @@ impl ControllerOperator {
         Ok(())
     }
 
+    /// Creates the image, or returns the size of an existing one that satisfies the range.
+    /// `required` and `limit` follow CSI `CapacityRange`: 0 means unspecified.
     pub async fn create_volume(
         &self,
         volume_id: &str,
-        capacity: Option<i64>,
+        required: i64,
+        limit: i64,
         url: &str,
     ) -> Result<i64, ControllerError> {
         let (id_url, _) = parse_volume_id(volume_id).ok_or(ControllerError::VolumeIdParse)?;
         if id_url != url {
             return Err(ControllerError::VolumeIdParse);
         }
+        let size = self.resolve_size(required, limit)?;
         let _guard = self.locks.lock(volume_id).await;
 
-        let size = capacity
-            .filter(|size| *size > 0)
-            .unwrap_or(self.default_size);
         let path = self.volume_file_path(volume_id).await?;
         if tokio::fs::try_exists(&path).await? {
             let existing = tokio::fs::metadata(&path).await?.len() as i64;
-            if existing < size {
+            if existing < size || (limit > 0 && existing > limit) {
                 return Err(ControllerError::ExistingSize(existing, size));
             }
             return Ok(existing);
@@ -225,10 +246,13 @@ impl ControllerOperator {
         }
     }
 
+    /// Grows the image to `required` (rounded up to [`BLOCK_SIZE`]). Asking for less than
+    /// the current size is not an error: the volume already satisfies the request.
     pub async fn expand_volume(
         &self,
         volume_id: &str,
-        size: Option<i64>,
+        required: i64,
+        limit: i64,
     ) -> Result<i64, ControllerError> {
         let _guard = self.locks.lock(volume_id).await;
 
@@ -241,11 +265,15 @@ impl ControllerOperator {
             .open(&path)
             .await?;
         let current = file.metadata().await?.len() as i64;
-        let size = size.filter(|size| *size > 0).unwrap_or(current);
-        if size < current {
-            return Err(ControllerError::ExistingSize(current, size));
+        if required <= current {
+            if limit > 0 && current > limit {
+                return Err(ControllerError::ExceedsLimit(current, limit));
+            }
+            return Ok(current);
         }
+        let size = self.resolve_size(required, limit)?;
         file.set_len(size as u64).await?;
+        file.sync_all().await?;
         Ok(size)
     }
 }
@@ -307,16 +335,21 @@ mod tests {
         let id = f.id("pvc-123");
 
         assert_eq!(
-            operator.create_volume(&id, Some(2048), url).await.unwrap(),
-            2048
+            operator.create_volume(&id, 8192, 0, url).await.unwrap(),
+            8192
         );
         assert_eq!(
-            operator.create_volume(&id, Some(1024), url).await.unwrap(),
-            2048
+            operator.create_volume(&id, 4096, 0, url).await.unwrap(),
+            8192
         );
-        assert_eq!(operator.volume_size(&id).await.unwrap(), 2048);
+        assert_eq!(operator.volume_size(&id).await.unwrap(), 8192);
         assert!(matches!(
-            operator.create_volume(&id, Some(4096), url).await,
+            operator.create_volume(&id, 16384, 0, url).await,
+            Err(ControllerError::ExistingSize(..))
+        ));
+        // An existing volume larger than the limit does not satisfy the request either.
+        assert!(matches!(
+            operator.create_volume(&id, 4096, 4096, url).await,
             Err(ControllerError::ExistingSize(..))
         ));
         operator.publish_volume(&id, "node-a").await.unwrap();
@@ -330,10 +363,40 @@ mod tests {
             Err(ControllerError::StillAttached { .. })
         ));
         operator.unpublish_volume(&id, "node-a").await.unwrap();
-        assert_eq!(operator.expand_volume(&id, Some(4096)).await.unwrap(), 4096);
+        assert_eq!(operator.expand_volume(&id, 10000, 0).await.unwrap(), 12288);
+        // Shrinking is a no-op that reports the current size.
+        assert_eq!(operator.expand_volume(&id, 4096, 0).await.unwrap(), 12288);
+        assert!(matches!(
+            operator.expand_volume(&id, 4096, 8192).await,
+            Err(ControllerError::ExceedsLimit(..))
+        ));
+        assert!(matches!(
+            operator.expand_volume(&id, 20000, 20000).await,
+            Err(ControllerError::ExceedsLimit(..))
+        ));
+        assert_eq!(operator.volume_size(&id).await.unwrap(), 12288);
         operator.delete_volume(&id).await.unwrap();
         operator.delete_volume(&id).await.unwrap();
         assert!(!storage.join(VOLUME_DIR).join("pvc-123.img").exists());
+        tokio::fs::remove_dir_all(&f.root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sizes_are_rounded_to_blocks_within_the_limit() {
+        let f = Fixture::new("sizes").await;
+        let op = &f.operator;
+        assert_eq!(op.resolve_size(0, 0).unwrap(), 4096); // default 1024, rounded
+        assert_eq!(op.resolve_size(4096, 0).unwrap(), 4096);
+        assert_eq!(op.resolve_size(4097, 0).unwrap(), 8192);
+        assert_eq!(op.resolve_size(1, 4096).unwrap(), 4096);
+        // No whole block fits between required and limit.
+        assert!(op.resolve_size(4097, 5000).is_err());
+        assert!(op.resolve_size(0, 1000).is_err());
+        assert!(op.resolve_size(i64::MAX, 0).is_err());
+        assert!(matches!(
+            op.create_volume(&f.id("pvc-1"), 4097, 5000, &f.url).await,
+            Err(ControllerError::ExceedsLimit(..))
+        ));
         tokio::fs::remove_dir_all(&f.root).await.unwrap();
     }
 
@@ -347,13 +410,13 @@ mod tests {
 
         assert_eq!(
             f.operator
-                .create_volume(&id, Some(2048), &f.url)
+                .create_volume(&id, 8192, 0, &f.url)
                 .await
                 .unwrap(),
-            2048
+            8192
         );
         assert!(!leftover.exists());
-        assert_eq!(f.operator.volume_size(&id).await.unwrap(), 2048);
+        assert_eq!(f.operator.volume_size(&id).await.unwrap(), 8192);
         tokio::fs::remove_dir_all(&f.root).await.unwrap();
     }
 
@@ -361,10 +424,7 @@ mod tests {
     async fn concurrent_publish_attaches_to_one_node_only() {
         let f = Fixture::new("concurrent").await;
         let id = f.id("pvc-1");
-        f.operator
-            .create_volume(&id, Some(1024), &f.url)
-            .await
-            .unwrap();
+        f.operator.create_volume(&id, 0, 0, &f.url).await.unwrap();
         let operator = Arc::new(f.operator);
 
         let tasks: Vec<_> = (0..16)

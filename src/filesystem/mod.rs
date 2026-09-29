@@ -39,7 +39,11 @@ impl FilesystemManager {
         if filesystem != Filesystem::Ext4 {
             return Err(unsupported(filesystem));
         }
-        let res = Command::new("resize2fs").arg(device).output().await?;
+        let res = Command::new("resize2fs")
+            .arg("--")
+            .arg(device)
+            .output()
+            .await?;
         if res.status.success() {
             Ok(())
         } else {
@@ -49,6 +53,13 @@ impl FilesystemManager {
 
     /// Formats `device`. Callers must make sure the device holds no data worth keeping:
     /// no `-F`-style override is passed, so `mkfs` also refuses devices it finds in use.
+    ///
+    /// The image lives on shared storage that other nodes can attach too, e.g. after a
+    /// node that stopped responding was force-detached. Multi-mount protection (`mmp`)
+    /// makes the kernel refuse to mount the filesystem while another host has it mounted,
+    /// instead of letting two hosts corrupt it. A cleanly unmounted filesystem mounts at
+    /// once; otherwise (in use elsewhere, or its node crashed) the mount first waits a few
+    /// MMP intervals, typically tens of seconds, to see whether someone is still using it.
     pub async fn create(
         &self,
         filesystem: Filesystem,
@@ -57,7 +68,11 @@ impl FilesystemManager {
         if filesystem != Filesystem::Ext4 {
             return Err(unsupported(filesystem));
         }
-        let res = Command::new("mkfs.ext4").arg(device).output().await?;
+        let res = Command::new("mkfs.ext4")
+            .args(["-O", "mmp", "--"])
+            .arg(device)
+            .output()
+            .await?;
         if res.status.success() {
             Ok(filesystem)
         } else {

@@ -24,6 +24,16 @@ Image files are sparse, so the backing storage is not reserved up front and can 
 use. The controller keeps a per-volume lock but does not coordinate several controller processes that share one backing
 directory; run a single active controller.
 
+New volumes are formatted with ext4 multi-mount protection (`mmp`): while one host has a volume mounted, the kernel
+refuses to mount it on another, e.g. after Kubernetes force-detaches a volume from a node that stopped responding but is
+still running. A cleanly unmounted volume mounts immediately; one that was not (in use elsewhere, or its node crashed)
+first waits a few MMP intervals, typically tens of seconds. Volumes formatted by earlier versions lack this protection
+until `tune2fs -O mmp` is run on the unmounted image. Volume sizes are rounded up to whole 4 KiB blocks.
+
+The storage URL is part of every volume ID, so volumes stay tied to the URL they were created with: if an NFS server
+moves to another address, existing PersistentVolumes cannot follow it. NFS exports are mounted with the default options
+of `mount.nfs`; URLs with query strings are rejected, so options such as `nfsvers` cannot be set yet.
+
 The driver supports ext4 filesystem volumes with `SINGLE_NODE_WRITER` or `SINGLE_NODE_READER_ONLY` access. It does not
 support block volumes, other filesystems, mount flags, or volume mount groups. The node runs `mkfs.ext4` when formatting
 a new volume and `resize2fs` when expanding one; it formats only a device whose first MiB is entirely zero and refuses
@@ -56,19 +66,26 @@ selects text logs instead of JSON logs; the log level comes from `RUST_LOG` (def
 `--allowed-url-prefix` (repeatable) restricts which storage URLs may be mounted, matching on `/` boundaries, e.g.
 `--allowed-url-prefix nfs://nfs.example.com/export`. Because the URL is part of every volume ID, set it in production:
 without it, whoever can create a PersistentVolume or StorageClass can make the driver mount any URL. The gRPC API has no
-authentication or TLS, so prefer a Unix socket over `tcp://`. The Node API uses `NODE_ID` as its node identifier, falling back to
-`/etc/hostname`. See `--help` for all options.
+authentication or TLS, so prefer a Unix socket over `tcp://`. The Node API requires `--node-id` (or `NODE_ID`), which must match the name the
+CO uses for the node (in Kubernetes, the node name). See `--help` for all options.
 
 ## Kubernetes status
 
 [deploy/manifests](deploy/manifests) contains a CSIDriver, RBAC, a controller Deployment, a node DaemonSet, and
 [an example StorageClass](deploy/manifests/storageclass.yaml) that sets the required `url` parameter and `fsType: ext4`.
-These manifests have not been applied to a real cluster yet; review the image tags, the `--allowed-url-prefix` value,
-and the privileges before use.
+Apply the driver with `kubectl apply -k deploy/manifests`, then adapt and apply the StorageClass. The manifests are
+exercised on kind (see below) but not yet on a production cluster; review the image tag, the `--allowed-url-prefix`
+value, and the privileges before use.
 
 The basic create, publish, stage, expand, unpublish, unstage, and delete operations are implemented. Snapshot, listing,
 health, and other optional CSI RPCs return `UNIMPLEMENTED`. Node mounting requires a privileged Linux host with loop
-devices; the automated tests cover the local file lifecycle but do not exercise privileged mount operations or NFS.
+devices.
+
+Unit tests (`cargo test`) cover the controller's local file lifecycle and need no privileges. The end-to-end test
+[test/e2e/run.sh](test/e2e/run.sh) builds the image, deploys the manifests to a [kind](https://kind.sigs.k8s.io/)
+cluster with a `file://` storage directory on the kind node, and takes a PVC through provisioning, writing, online
+expansion, a read-only remount, multi-mount protection, and deletion. It needs Docker, kind, kubectl, and a host kernel
+with loop devices; set `KEEP_CLUSTER=1` to keep the cluster for debugging. NFS backing storage is not covered yet.
 
 ## License
 

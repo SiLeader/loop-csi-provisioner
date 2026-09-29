@@ -30,6 +30,16 @@ pub(crate) enum NodeError {
     #[error("Device {0} holds data that is not a supported filesystem; refusing to format it")]
     NotBlank(String),
 
+    #[error("Device {0} has no filesystem and the volume is read-only; refusing to format it")]
+    ReadOnlyUnformatted(String),
+
+    #[error("Loop device {device} has {actual} bytes but the volume has {expected}")]
+    CapacityNotVisible {
+        device: String,
+        actual: u64,
+        expected: u64,
+    },
+
     #[error(transparent)]
     Fs(#[from] FsError),
 }
@@ -68,8 +78,16 @@ impl From<NodeError> for tonic::Status {
                 "Device {} holds data that is not a supported filesystem; refusing to format it",
                 device
             )),
+            e @ NodeError::ReadOnlyUnformatted(_) => {
+                tonic::Status::failed_precondition(e.to_string())
+            }
+            // Usually the node has not yet seen the size the controller set; a retry helps.
+            e @ NodeError::CapacityNotVisible { .. } => tonic::Status::unavailable(e.to_string()),
             NodeError::Mount(crate::mount::MountError::UrlNotAllowed(url)) => {
                 tonic::Status::permission_denied(format!("Storage URL {} is not allowed", url))
+            }
+            NodeError::Mount(e @ crate::mount::MountError::Unresponsive(_)) => {
+                tonic::Status::unavailable(format!("Mount error: {}", e))
             }
             NodeError::Mount(e) => tonic::Status::internal(format!("Mount error: {}", e)),
             NodeError::Fs(e) => tonic::Status::internal(format!("Fs error: {}", e)),

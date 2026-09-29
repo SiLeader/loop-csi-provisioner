@@ -5,6 +5,7 @@ metadata:
 provisioner: loop-csi-provisioner
 parameters:
   fsType: ext4
+  # Placeholder: point this at your NFS export (it must be allowed by --allowed-url-prefix).
   url: nfs://127.0.0.1/share
 reclaimPolicy: Delete
 allowVolumeExpansion: true

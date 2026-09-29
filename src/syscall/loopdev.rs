@@ -1,10 +1,51 @@
 use crate::syscall::Syscall;
-use rustix::fs::{Mode, OFlags, major, minor, open, stat};
+use rustix::fs::{
+    CWD, FileType, Mode, OFlags, SeekFrom, fstat, major, makedev, minor, mknodat, open, seek, stat,
+};
 use rustix::io::Errno;
 use rustix::ioctl::{Getter, Ioctl, IoctlOutput, NoArg, Opcode, Setter, ioctl};
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+
+/// Returns `/dev/<name>` for the block device `name`, creating the device node if missing.
+///
+/// In a container whose `/dev` is a copy made at start-up (e.g. a kind node), loop devices
+/// the kernel creates later have no node, so it is made from the numbers sysfs reports.
+fn device_node(name: &str) -> std::io::Result<PathBuf> {
+    let path = Path::new("/dev").join(name);
+    if path.exists() {
+        return Ok(path);
+    }
+    let numbers = std::fs::read_to_string(Path::new("/sys/block").join(name).join("dev"))?;
+    let (major, minor) = parse_dev_numbers(&numbers).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected device numbers for {name}: {numbers:?}"),
+        )
+    })?;
+    match mknodat(
+        CWD,
+        &path,
+        FileType::BlockDevice,
+        Mode::from_raw_mode(0o660),
+        makedev(major, minor),
+    ) {
+        Ok(()) | Err(Errno::EXIST) => Ok(path),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Parses the `MAJOR:MINOR` format of sysfs `dev` files.
+fn parse_dev_numbers(value: &str) -> Option<(u32, u32)> {
+    let (major, minor) = value.trim().split_once(':')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Returns true when the sysfs directory of a block device describes a bound loop device.
+fn is_bound_loop(sys_dir: &Path) -> bool {
+    sys_dir.join("loop").join("backing_file").exists()
+}
 
 impl Syscall {
     /// Attaches `file` to a free loop device and returns the device path.
@@ -47,23 +88,43 @@ impl Syscall {
         let path = path.as_ref().to_path_buf();
         Self::spawn(move || {
             let dev = stat(path.as_path())?.st_dev;
-            if major(dev) == LOOP_MAJOR {
-                Ok(Some(PathBuf::from(format!("/dev/loop{}", minor(dev)))))
-            } else {
-                Ok(None)
+            // Look the device up instead of deriving `loopN` from the minor number, which
+            // does not hold when the loop driver reserves minors for partitions (max_part).
+            let sys_dir = PathBuf::from(format!("/sys/dev/block/{}:{}", major(dev), minor(dev)));
+            if !is_bound_loop(&sys_dir) {
+                return Ok(None);
             }
+            let target = std::fs::read_link(&sys_dir)?;
+            let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
+                return Ok(None);
+            };
+            Ok(Some(device_node(name)?))
         })
         .await
     }
 
-    pub async fn apply_loop_device_capacity(
+    /// Makes the loop device pick up the current size of `image` and returns the device's
+    /// new size in bytes.
+    pub async fn refresh_loop_device_capacity(
         &self,
         loop_device: impl AsRef<Path>,
-    ) -> std::io::Result<()> {
+        image: impl AsRef<Path>,
+    ) -> std::io::Result<u64> {
         let ld = loop_device.as_ref().to_path_buf();
+        let image = image.as_ref().to_path_buf();
         Self::spawn(move || {
+            // LOOP_SET_CAPACITY uses the size the kernel has cached for the image's inode.
+            // Opening the image by path makes an NFS client revalidate that cache
+            // (close-to-open consistency), so a resize done by the controller is seen.
+            let image = open(
+                image.as_path(),
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            fstat(&image)?;
             let ld = LoopDevice::open(ld)?;
-            ld.apply_capacity()
+            ld.apply_capacity()?;
+            ld.size()
         })
         .await
     }
@@ -88,8 +149,6 @@ impl Syscall {
 async fn get_attached_loop_device(
     image_file: impl AsRef<Path>,
 ) -> std::io::Result<Option<PathBuf>> {
-    let dev_fs = Path::new("/dev");
-
     let image_file = image_file.as_ref().to_path_buf();
     let image_stat = Syscall::spawn(move || Ok(stat(image_file.as_path())?)).await?;
 
@@ -100,28 +159,30 @@ async fn get_attached_loop_device(
             continue;
         };
 
-        if !name.starts_with("loop") {
+        // Unbound loop devices have no backing file to compare, so skip them early.
+        if !name.starts_with("loop") || !is_bound_loop(&entry.path()) {
             continue;
         }
-
-        let device_file = dev_fs.join(name);
-        let device = device_file.clone();
+        let name = name.to_string();
 
         let info = Syscall::spawn(move || {
-            let Ok(ld) = LoopDevice::open(device) else {
+            let Ok(device) = device_node(&name) else {
+                return Ok(None);
+            };
+            let Ok(ld) = LoopDevice::open(device.clone()) else {
                 return Ok(None);
             };
             let Ok(info) = ld.get_status() else {
                 return Ok(None);
             };
-            Ok(Some(info))
+            Ok(Some((device, info)))
         })
         .await?;
-        if let Some(info) = info
+        if let Some((device, info)) = info
             && info.lo_device == image_stat.st_dev
             && info.lo_inode == image_stat.st_ino
         {
-            return Ok(Some(device_file));
+            return Ok(Some(device));
         }
     }
     Ok(None)
@@ -141,9 +202,6 @@ const LOOP_CONFIGURE: Opcode = linux_raw_sys::loop_device::LOOP_CONFIGURE;
 const LOOP_CLR_FD: Opcode = linux_raw_sys::loop_device::LOOP_CLR_FD;
 const LOOP_SET_CAPACITY: Opcode = linux_raw_sys::loop_device::LOOP_SET_CAPACITY;
 const LOOP_GET_STATUS64: Opcode = linux_raw_sys::loop_device::LOOP_GET_STATUS64;
-
-/// Major number of loop block devices.
-const LOOP_MAJOR: u32 = 7;
 
 /// How many times attaching is retried when a concurrent caller grabs the same free device.
 const ATTACH_ATTEMPTS: u32 = 16;
@@ -200,8 +258,7 @@ impl LoopControl {
         if num < 0 {
             Err(std::io::Error::last_os_error())
         } else {
-            let path = PathBuf::from(format!("/dev/loop{}", num));
-            LoopDevice::open(path)
+            LoopDevice::open(device_node(&format!("loop{num}"))?)
         }
     }
 }
@@ -223,7 +280,8 @@ impl LoopDevice {
         };
 
         unsafe {
-            let ctl = Setter::<LOOP_CONFIGURE, &LoopConfig>::new(&config);
+            // Setter passes a pointer to its value, so the value must be the struct itself.
+            let ctl = Setter::<LOOP_CONFIGURE, LoopConfig>::new(config);
             ioctl(&self.file, ctl)?;
         }
 
@@ -242,6 +300,10 @@ impl LoopDevice {
             ioctl(&self.file, NoArg::<LOOP_SET_CAPACITY>::new())?;
         }
         Ok(())
+    }
+
+    fn size(&self) -> std::io::Result<u64> {
+        Ok(seek(&self.file, SeekFrom::End(0))?)
     }
 
     fn get_status(&self) -> std::io::Result<LoopInfo64> {
@@ -291,5 +353,18 @@ unsafe impl<const OPCODE: Opcode> Ioctl for RetValue<OPCODE> {
         _extract_output: *mut c_void,
     ) -> rustix::io::Result<Self::Output> {
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sysfs_device_numbers() {
+        assert_eq!(parse_dev_numbers("7:3\n"), Some((7, 3)));
+        assert_eq!(parse_dev_numbers("259:1048576"), Some((259, 1048576)));
+        assert_eq!(parse_dev_numbers("7"), None);
+        assert_eq!(parse_dev_numbers("a:b"), None);
     }
 }

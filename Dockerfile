@@ -26,4 +26,4 @@ RUN apt-get update && \
 
 COPY --from=builder /loop-csi-provisioner /usr/sbin/loop-csi-provisioner
 
-CMD ["/usr/sbin/loop-csi-provisioner"]
+ENTRYPOINT ["/usr/sbin/loop-csi-provisioner"]

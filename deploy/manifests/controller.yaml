@@ -19,13 +19,14 @@ spec:
       serviceAccountName: loop-csi-controller
       containers:
         - name: driver
-          image: ghcr.io/sileader/loop-csi-provisioner:latest
+          image: ghcr.io/sileader/loop-csi-provisioner:v0.1.0
           args:
             - --controller-api
             - --identity-api
             - --listen=unix:///csi/csi.sock
             - --base-directory=/var/lib/loop-csi-provisioner
-            # Replace with the storage URL(s) used by your StorageClasses.
+            # Placeholder: replace with the storage URL(s) used by your StorageClasses.
+            # 127.0.0.1 would be the pod itself, not an NFS server.
             - --allowed-url-prefix=nfs://127.0.0.1/share
           securityContext:
             # The controller mounts the backing NFS export itself.

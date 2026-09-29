@@ -1,7 +1,7 @@
 mod error;
 pub(crate) mod operator;
 
-use crate::capability::supported_capability;
+use crate::capability::{is_read_only, supported_capability};
 use crate::node::operator::NodeOperator;
 use crate::proto::csi::v1::node_server::Node;
 use crate::proto::csi::v1::{
@@ -14,15 +14,21 @@ use crate::proto::csi::v1::{
     NodeUnpublishVolumeResponse, NodeUnstageVolumeRequest, NodeUnstageVolumeResponse,
     VolumeCapability, node_service_capability,
 };
+use crate::task::run_to_completion;
+use std::sync::Arc;
 use tonic::{Request, Response, Status, async_trait};
 
 pub(crate) struct LoopCsiNode {
-    operator: NodeOperator,
+    operator: Arc<NodeOperator>,
+    node_id: String,
 }
 
 impl LoopCsiNode {
-    pub fn new(operator: NodeOperator) -> Self {
-        Self { operator }
+    pub fn new(operator: NodeOperator, node_id: String) -> Self {
+        Self {
+            operator: Arc::new(operator),
+            node_id,
+        }
     }
 }
 
@@ -34,13 +40,14 @@ fn require(value: &str, name: &str) -> Result<(), Status> {
     }
 }
 
-fn require_capability(capability: Option<&VolumeCapability>) -> Result<(), Status> {
+/// Validates the capability and returns whether it only allows reading.
+fn require_capability(capability: Option<&VolumeCapability>) -> Result<bool, Status> {
     match capability {
         None => Err(Status::invalid_argument("Missing volume capability")),
         Some(capability) if !supported_capability(capability) => Err(Status::invalid_argument(
             "Only ext4 mount volumes with single-node access are supported",
         )),
-        Some(_) => Ok(()),
+        Some(capability) => Ok(is_read_only(capability)),
     }
 }
 
@@ -53,11 +60,15 @@ impl Node for LoopCsiNode {
         let request = request.into_inner();
         require(&request.volume_id, "volume ID")?;
         require(&request.staging_target_path, "staging target path")?;
-        require_capability(request.volume_capability.as_ref())?;
+        let read_only = require_capability(request.volume_capability.as_ref())?;
 
-        self.operator
-            .stage_volume(&request.volume_id, &request.staging_target_path)
-            .await?;
+        let operator = self.operator.clone();
+        run_to_completion("NodeStageVolume", async move {
+            operator
+                .stage_volume(&request.volume_id, &request.staging_target_path, read_only)
+                .await
+        })
+        .await?;
 
         Ok(Response::new(NodeStageVolumeResponse {}))
     }
@@ -69,9 +80,13 @@ impl Node for LoopCsiNode {
         let request = request.into_inner();
         require(&request.volume_id, "volume ID")?;
         require(&request.staging_target_path, "staging target path")?;
-        self.operator
-            .unstage_volume(&request.volume_id, &request.staging_target_path)
-            .await?;
+        let operator = self.operator.clone();
+        run_to_completion("NodeUnstageVolume", async move {
+            operator
+                .unstage_volume(&request.volume_id, &request.staging_target_path)
+                .await
+        })
+        .await?;
         Ok(Response::new(NodeUnstageVolumeResponse {}))
     }
 
@@ -83,15 +98,19 @@ impl Node for LoopCsiNode {
         require(&request.volume_id, "volume ID")?;
         require(&request.staging_target_path, "staging target path")?;
         require(&request.target_path, "target path")?;
-        require_capability(request.volume_capability.as_ref())?;
+        let read_only = require_capability(request.volume_capability.as_ref())? || request.readonly;
 
-        self.operator
-            .publish_volume(
-                &request.staging_target_path,
-                &request.target_path,
-                request.readonly,
-            )
-            .await?;
+        let operator = self.operator.clone();
+        run_to_completion("NodePublishVolume", async move {
+            operator
+                .publish_volume(
+                    &request.staging_target_path,
+                    &request.target_path,
+                    read_only,
+                )
+                .await
+        })
+        .await?;
         Ok(Response::new(NodePublishVolumeResponse {}))
     }
 
@@ -102,7 +121,11 @@ impl Node for LoopCsiNode {
         let request = request.into_inner();
         require(&request.volume_id, "volume ID")?;
         require(&request.target_path, "target path")?;
-        self.operator.unpublish_volume(&request.target_path).await?;
+        let operator = self.operator.clone();
+        run_to_completion("NodeUnpublishVolume", async move {
+            operator.unpublish_volume(&request.target_path).await
+        })
+        .await?;
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }
 
@@ -139,8 +162,16 @@ impl Node for LoopCsiNode {
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
         let request = request.into_inner();
         require(&request.volume_id, "volume ID")?;
+        let required = request
+            .capacity_range
+            .as_ref()
+            .map_or(0, |range| range.required_bytes);
 
-        let capacity_bytes = self.operator.expand_volume(&request.volume_id).await?;
+        let operator = self.operator.clone();
+        let capacity_bytes = run_to_completion("NodeExpandVolume", async move {
+            operator.expand_volume(&request.volume_id, required).await
+        })
+        .await?;
 
         Ok(Response::new(NodeExpandVolumeResponse { capacity_bytes }))
     }
@@ -168,18 +199,8 @@ impl Node for LoopCsiNode {
         &self,
         _request: Request<NodeGetInfoRequest>,
     ) -> Result<Response<NodeGetInfoResponse>, Status> {
-        let node_id = std::env::var("NODE_ID")
-            .ok()
-            .filter(|id| !id.is_empty())
-            .or_else(|| {
-                std::fs::read_to_string("/etc/hostname")
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            })
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| Status::internal("Unable to determine node ID"))?;
         Ok(Response::new(NodeGetInfoResponse {
-            node_id,
+            node_id: self.node_id.clone(),
             max_volumes_per_node: 0,
             accessible_topology: None,
         }))

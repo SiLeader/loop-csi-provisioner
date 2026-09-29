@@ -27,6 +27,9 @@ pub(crate) enum MountError {
     #[error("Storage URL is not allowed by --allowed-url-prefix: {0}")]
     UrlNotAllowed(String),
 
+    #[error("Mount point {0} did not respond in time; is the storage server reachable?")]
+    Unresponsive(String),
+
     #[error("Command failed with code {code}: {message}")]
     CommandFailure { code: i32, message: String },
 }

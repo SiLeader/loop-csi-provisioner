@@ -1,0 +1,21 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: loop-e2e
+provisioner: loop-csi-provisioner
+parameters:
+  url: file:///var/lib/loop-csi-storage
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Points outside --allowed-url-prefix; provisioning must be refused.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: loop-e2e-forbidden
+provisioner: loop-csi-provisioner
+parameters:
+  url: file:///etc
+reclaimPolicy: Delete
+volumeBindingMode: Immediate

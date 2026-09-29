@@ -27,6 +27,7 @@ mod mount;
 mod node;
 mod proto;
 mod syscall;
+mod task;
 mod volume_id;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -70,6 +71,15 @@ struct Args {
     )]
     allowed_url_prefixes: Vec<String>,
 
+    #[arg(
+        long,
+        env = "NODE_ID",
+        default_value = "",
+        help = "Node identifier reported by the Node API; must match the name the CO uses for \
+                ControllerPublishVolume (in Kubernetes, the node name). Required with the Node API"
+    )]
+    node_id: String,
+
     #[arg(long, help = "Use plaintext logging instead of structured logging")]
     plaintext_log: bool,
 }
@@ -105,8 +115,13 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(MountManager::default().with_allowed_prefixes(args.allowed_url_prefixes));
 
     let node = if node_api {
+        anyhow::ensure!(
+            !args.node_id.is_empty(),
+            "--node-id (or NODE_ID) is required when serving the Node API"
+        );
         Some(NodeServer::new(LoopCsiNode::new(
             NodeOperator::new(args.base_directory.clone(), mounter.clone()).await?,
+            args.node_id,
         )))
     } else {
         None

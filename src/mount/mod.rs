@@ -1,9 +1,11 @@
 pub(crate) use crate::mount::error::MountError;
 
+use crate::lock::KeyedLocks;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 use tonic::async_trait;
 use tonic::transport::Uri;
 
@@ -22,6 +24,10 @@ pub(crate) trait Mounter: Send + Sync {
 
 /// Longest encoded mount point directory name; file names are limited to 255 bytes.
 const MAX_MOUNT_POINT_NAME: usize = 200;
+
+/// How long checking an existing mount point may take. A `stat` on a hard-mounted NFS
+/// export whose server is gone never returns; this bounds how long a request waits for it.
+const MOUNT_POINT_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Encodes `value` into a single path component. Every byte except ASCII alphanumerics
 /// and `.` becomes `%XX`, so distinct inputs always yield distinct names.
@@ -57,8 +63,9 @@ fn url_allowed(prefixes: &[String], url: &str) -> bool {
 pub(crate) struct MountManager {
     mounters: HashMap<String, Box<dyn Mounter>>,
     allowed_prefixes: Vec<String>,
-    /// Serializes mounting so concurrent requests cannot stack the same mount twice.
-    lock: tokio::sync::Mutex<()>,
+    /// Serializes mounting per mount point so concurrent requests cannot stack the same
+    /// mount twice, while a slow or unreachable server only delays its own volumes.
+    locks: KeyedLocks,
 }
 
 impl Default for MountManager {
@@ -80,7 +87,7 @@ impl MountManager {
         MountManager {
             mounters: mounters_map,
             allowed_prefixes: Vec::new(),
-            lock: tokio::sync::Mutex::new(()),
+            locks: KeyedLocks::default(),
         }
     }
 
@@ -108,22 +115,25 @@ impl MountManager {
         if uri.query().is_some() || uri.path().split('/').any(|s| s == "." || s == "..") {
             return Err(MountError::InvalidUrl(url.to_string()));
         }
-        let _guard = self.lock.lock().await;
-        if let Some(mounter) = self.mounters.get(scheme) {
-            let mount_point = mounter.mount_point(&uri, base)?;
-            if scheme == "file" {
-                mounter.mount(&uri, &mount_point).await?;
-                return Ok(mount_point);
-            }
-            tokio::fs::create_dir_all(&mount_point).await?;
-            if self.check_mount_point(&mount_point).await? {
-                return Ok(mount_point);
-            }
+        let Some(mounter) = self.mounters.get(scheme) else {
+            return Err(MountError::UnsupportedProtocol(scheme.to_string()));
+        };
+        let mount_point = mounter.mount_point(&uri, base)?;
+        let _guard = self.locks.lock(&mount_point).await;
+        if scheme == "file" {
             mounter.mount(&uri, &mount_point).await?;
-            Ok(mount_point)
-        } else {
-            Err(MountError::UnsupportedProtocol(scheme.to_string()))
+            return Ok(mount_point);
         }
+        let mounted = tokio::time::timeout(MOUNT_POINT_CHECK_TIMEOUT, async {
+            tokio::fs::create_dir_all(&mount_point).await?;
+            self.check_mount_point(&mount_point).await
+        })
+        .await
+        .map_err(|_| MountError::Unresponsive(mount_point.clone()))??;
+        if !mounted {
+            mounter.mount(&uri, &mount_point).await?;
+        }
+        Ok(mount_point)
     }
 
     pub async fn check_mount_point(&self, target: &str) -> Result<bool, MountError> {

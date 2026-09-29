@@ -1,0 +1,14 @@
+# Deploys the driver for the kind e2e test (see run.sh): the locally built image and a
+# file:// storage directory on the kind node, shared by the controller and node pods.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../deploy/manifests
+  - storageclass.yaml
+images:
+  - name: ghcr.io/sileader/loop-csi-provisioner
+    newName: loop-csi-provisioner
+    newTag: e2e
+patches:
+  - path: controller-patch.yaml
+  - path: node-patch.yaml

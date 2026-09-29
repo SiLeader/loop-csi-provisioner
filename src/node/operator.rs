@@ -56,10 +56,13 @@ impl NodeOperator {
         Ok((device.to_string_lossy().to_string(), true))
     }
 
+    /// Attaches, formats if blank, and mounts the volume. A `read_only` volume is mounted
+    /// read-only and never formatted.
     pub async fn stage_volume(
         &self,
         volume_id: &str,
         staging_target_path: &str,
+        read_only: bool,
     ) -> Result<(), NodeError> {
         let _guard = self.locks.lock(volume_id).await;
 
@@ -70,7 +73,7 @@ impl NodeOperator {
         let (loop_device, newly_attached) = self.ensure_loop_device(volume_id).await?;
 
         match self
-            .format_and_mount(&loop_device, staging_target_path)
+            .format_and_mount(&loop_device, staging_target_path, read_only)
             .await
         {
             Ok(()) => Ok(()),
@@ -90,8 +93,12 @@ impl NodeOperator {
         &self,
         loop_device: &str,
         staging_target_path: &str,
+        read_only: bool,
     ) -> Result<(), NodeError> {
         let fs = match self.syscall.detect_filesystem(loop_device).await? {
+            None if read_only => {
+                return Err(NodeError::ReadOnlyUnformatted(loop_device.to_string()));
+            }
             None => {
                 // Only format a device that is entirely unused; anything else may be someone's data.
                 if !self.syscall.is_blank(loop_device).await? {
@@ -107,7 +114,7 @@ impl NodeOperator {
             .mount(
                 MountSource::fs(fs, loop_device),
                 staging_target_path,
-                MountOptions::default(),
+                MountOptions::default().readonly(read_only),
             )
             .await?;
         Ok(())
@@ -199,7 +206,9 @@ impl NodeOperator {
         Ok(())
     }
 
-    pub async fn expand_volume(&self, volume_id: &str) -> Result<i64, NodeError> {
+    /// Grows the filesystem to the size of the image and returns the new capacity.
+    /// `required` is the size the CO expects, or 0 when it did not say.
+    pub async fn expand_volume(&self, volume_id: &str, required: i64) -> Result<i64, NodeError> {
         let _guard = self.locks.lock(volume_id).await;
 
         // The volume is mounted through an existing loop device; that device (not a new one)
@@ -208,15 +217,25 @@ impl NodeOperator {
             .attached_loop_device(volume_id)
             .await?
             .ok_or_else(|| NodeError::NotStaged(volume_id.to_string()))?;
-        self.syscall
-            .apply_loop_device_capacity(&loop_device)
+        let path = self.volume_file_path(volume_id).await?;
+        let device_size = self
+            .syscall
+            .refresh_loop_device_capacity(&loop_device, &path)
             .await?;
+        // Loop devices ignore a trailing partial sector of the image.
+        let image_size = tokio::fs::metadata(&path).await?.len() & !511;
+        let expected = image_size.max(u64::try_from(required).unwrap_or(0));
+        if device_size < expected {
+            // Growing the filesystem now would silently keep the old size.
+            return Err(NodeError::CapacityNotVisible {
+                device: loop_device,
+                actual: device_size,
+                expected,
+            });
+        }
 
         self.fs.resize(Filesystem::Ext4, &loop_device).await?;
-
-        let path = self.volume_file_path(volume_id).await?;
-        let metadata = tokio::fs::metadata(&path).await?;
-        Ok(metadata.len() as i64)
+        Ok(device_size as i64)
     }
 }
 
