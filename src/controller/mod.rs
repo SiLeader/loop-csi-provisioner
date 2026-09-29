@@ -1,8 +1,10 @@
 mod error;
+mod mutex;
 pub(crate) mod operator;
 
 use crate::capability::supported_capability;
 use crate::controller::error::ControllerError;
+use crate::controller::mutex::ControllerLeaseHolder;
 use crate::controller::operator::ControllerOperator;
 use crate::proto::csi::v1::CapacityRange;
 use crate::proto::csi::v1::controller_server::Controller;
@@ -29,12 +31,14 @@ use tonic::{Request, Response, Status, async_trait};
 
 pub(crate) struct LoopCsiController {
     operator: Arc<ControllerOperator>,
+    lease: ControllerLeaseHolder,
 }
 
 impl LoopCsiController {
-    pub fn new(operator: ControllerOperator) -> Self {
+    pub fn new(operator: ControllerOperator, lease: ControllerLeaseHolder) -> Self {
         Self {
             operator: Arc::new(operator),
+            lease,
         }
     }
 }
