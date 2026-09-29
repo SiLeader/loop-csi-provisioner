@@ -1,0 +1,208 @@
+name: Release
+
+# Run manually with the version to release:
+#   - If Cargo.toml and the deploy manifests are not at that version yet, a release/v<version>
+#     branch bumping them is pushed and a PR is opened. Merging that PR runs this workflow
+#     again, which tags the merge commit, builds the container image and creates the release.
+#   - If they already are at that version, the current master commit is released directly.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (semver, e.g. 1.2.3 or 1.2.3-rc.1)
+        required: true
+        type: string
+  pull_request:
+    branches:
+      - master
+    types:
+      - closed
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    # Only merged release PRs from this repository (not forks) trigger a release.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged &&
+       startsWith(github.event.pull_request.head.ref, 'release/v') &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      mode: ${{ steps.resolve.outputs.mode }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve version and release mode
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+              echo "::error::Run this workflow on master (got $GITHUB_REF)."
+              exit 1
+            fi
+            version="${INPUT_VERSION#v}"
+          else
+            version="${HEAD_REF#release/v}"
+          fi
+
+          # semver 2.0.0 without build metadata ('+' is not allowed in container image tags).
+          num='(0|[1-9][0-9]*)'
+          pre='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          if [[ ! "$version" =~ ^$num\.$num\.$num(-$pre(\.$pre)*)?$ ]]; then
+            echo "::error::'$version' is not a valid semver version (build metadata is not supported)."
+            exit 1
+          fi
+
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$version" --silent 2>/dev/null; then
+            echo "::error::Tag v$version already exists."
+            exit 1
+          fi
+
+          current=$(grep -E '^version\s*=' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)"/\1/')
+          stale_manifests=$(grep -LF "image: ghcr.io/sileader/loop-csi-provisioner:v$version" \
+            deploy/manifests/controller.yaml deploy/manifests/node.yaml || true)
+
+          if [[ "$current" == "$version" && -z "$stale_manifests" ]]; then
+            mode="release"
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            mode="pr"
+          else
+            echo "::error::The merged commit is not at v$version (Cargo.toml: $current, stale manifests: ${stale_manifests:-none})."
+            exit 1
+          fi
+
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+
+          echo "Releasing v$version (mode: $mode, prerelease: $prerelease)"
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "mode=$mode"
+          } >> "$GITHUB_OUTPUT"
+
+  open-pr:
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'pr'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Pushes and PRs made with GITHUB_TOKEN do not trigger other workflows, so CI (test.yml)
+      # does not run on the release PR. Set a RELEASE_TOKEN secret (a PAT or GitHub App token
+      # with contents and pull-requests write) to have it run, or close and reopen the PR.
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Bump version
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          sed -i -E "0,/^version = \".*\"$/s//version = \"$VERSION\"/" Cargo.toml
+          sed -i -E '/^name = "loop-csi-provisioner"$/{n;s/^version = ".*"$/version = "'"$VERSION"'"/}' Cargo.lock
+          sed -i -E "s#(image: ghcr\.io/sileader/loop-csi-provisioner:)[^[:space:]]+#\1v$VERSION#" \
+            deploy/manifests/controller.yaml deploy/manifests/node.yaml
+          # Fails if Cargo.lock no longer matches Cargo.toml.
+          cargo metadata --locked --format-version 1 > /dev/null
+          git diff
+
+      - name: Push release branch and open PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          branch="release/v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "chore: release v$VERSION"
+          # Fails if the branch already exists (e.g. an earlier release PR for this version).
+          git push origin "$branch"
+          gh pr create \
+            --base master \
+            --head "$branch" \
+            --title "chore: release v$VERSION" \
+            --body "Bumps the version to \`v$VERSION\`. Merging this PR tags the merge commit, builds and pushes the container image and creates the GitHub release."
+          echo "::notice::Opened the release PR for v$VERSION. Merge it to publish the release."
+
+  tag:
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          # Tolerate a tag left by an earlier attempt of this run, as long as it is the same commit.
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --jq .object.sha 2>/dev/null || true)
+          if [[ -z "$existing" ]]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/v$VERSION" -f sha="$SHA" --silent
+          elif [[ "$existing" != "$SHA" ]]; then
+            echo "::error::Tag v$VERSION already exists at $existing (expected $SHA)."
+            exit 1
+          fi
+
+  container:
+    needs: [resolve, tag]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/container.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      latest: ${{ needs.resolve.outputs.prerelease != 'true' }}
+
+  release:
+    needs: [resolve, container]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+        run: |
+          flags=(--latest)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            flags=(--prerelease --latest=false)
+          fi
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "v$VERSION" \
+            --generate-notes \
+            --notes "Container image: \`ghcr.io/sileader/loop-csi-provisioner:v$VERSION\`" \
+            "${flags[@]}"
