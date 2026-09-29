@@ -1,6 +1,6 @@
 use crate::filesystem::Filesystem;
 use crate::syscall::Syscall;
-use rustix::fs::{StatVfsMountFlags, statvfs};
+use rustix::fs::{StatVfsMountFlags, stat, statvfs};
 use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -66,6 +66,21 @@ impl MountOptions {
 }
 
 impl Syscall {
+    pub async fn same_file(
+        &self,
+        left: impl AsRef<Path>,
+        right: impl AsRef<Path>,
+    ) -> std::io::Result<bool> {
+        let left = left.as_ref().to_path_buf();
+        let right = right.as_ref().to_path_buf();
+        Self::spawn(move || {
+            let left = stat(left.as_path())?;
+            let right = stat(right.as_path())?;
+            Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
+        })
+        .await
+    }
+
     pub async fn mount(
         &self,
         source: MountSource,
@@ -142,5 +157,33 @@ impl Syscall {
         let path = path.as_ref().to_path_buf();
 
         Self::spawn(move || Ok(statvfs(path)?.f_flag.contains(StatVfsMountFlags::RDONLY))).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn same_file_compares_identity_not_path_text() {
+        let root = std::env::temp_dir().join(format!(
+            "loop-csi-same-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let left = root.join("left");
+        let alias = root.join("alias");
+        let right = root.join("right");
+        tokio::fs::create_dir_all(&left).await.unwrap();
+        tokio::fs::create_dir_all(&right).await.unwrap();
+        tokio::fs::symlink(&left, &alias).await.unwrap();
+
+        let syscall = Syscall::default();
+        assert!(syscall.same_file(&left, &alias).await.unwrap());
+        assert!(!syscall.same_file(&left, &right).await.unwrap());
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

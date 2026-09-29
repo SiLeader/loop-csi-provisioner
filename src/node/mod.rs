@@ -104,6 +104,7 @@ impl Node for LoopCsiNode {
         run_to_completion("NodePublishVolume", async move {
             operator
                 .publish_volume(
+                    &request.volume_id,
                     &request.staging_target_path,
                     &request.target_path,
                     read_only,

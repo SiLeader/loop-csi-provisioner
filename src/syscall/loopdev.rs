@@ -136,6 +136,21 @@ impl Syscall {
         get_attached_loop_device(image_path).await
     }
 
+    pub async fn loop_device_matches_image(
+        &self,
+        loop_device: impl AsRef<Path>,
+        image_path: impl AsRef<Path>,
+    ) -> std::io::Result<bool> {
+        let loop_device = loop_device.as_ref().to_path_buf();
+        let image_path = image_path.as_ref().to_path_buf();
+        Self::spawn(move || {
+            let image = stat(image_path.as_path())?;
+            let info = LoopDevice::open(loop_device)?.get_status()?;
+            Ok(info.lo_device == image.st_dev && info.lo_inode == image.st_ino)
+        })
+        .await
+    }
+
     pub async fn detach_loop(&self, loop_device: impl AsRef<Path>) -> std::io::Result<()> {
         let ld = loop_device.as_ref().to_path_buf();
         Self::spawn(move || {

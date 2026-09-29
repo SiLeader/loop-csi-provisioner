@@ -27,6 +27,12 @@ pub(crate) enum NodeError {
     #[error("Volume is not staged at {0}")]
     NotStagedAt(String),
 
+    #[error("Mount at {0} belongs to a different volume")]
+    WrongVolumeAt(String),
+
+    #[error("Mount at {0} does not match the requested source or access mode")]
+    WrongMountAt(String),
+
     #[error("Device {0} holds data that is not a supported filesystem; refusing to format it")]
     NotBlank(String),
 
@@ -73,6 +79,9 @@ impl From<NodeError> for tonic::Status {
             }
             NodeError::NotStagedAt(path) => {
                 tonic::Status::failed_precondition(format!("Volume is not staged at {}", path))
+            }
+            e @ (NodeError::WrongVolumeAt(_) | NodeError::WrongMountAt(_)) => {
+                tonic::Status::failed_precondition(e.to_string())
             }
             NodeError::NotBlank(device) => tonic::Status::failed_precondition(format!(
                 "Device {} holds data that is not a supported filesystem; refusing to format it",

@@ -61,16 +61,19 @@ impl ControllerOperator {
         })
     }
 
-    /// Returns the image size for a capacity range: `required` (or the default size when it
-    /// is 0) rounded up to [`BLOCK_SIZE`], which must not exceed a non-zero `limit`.
+    /// Returns the image size for a capacity range, rounded to whole blocks. With no required
+    /// size, choose the default or the largest whole-block size below the limit.
     fn resolve_size(&self, required: i64, limit: i64) -> Result<i64, ControllerError> {
         let wanted = if required > 0 {
             required
+        } else if limit > 0 {
+            self.default_size.min(limit - limit % BLOCK_SIZE as i64)
         } else {
             self.default_size
         };
         let size = u64::try_from(wanted)
             .ok()
+            .filter(|size| *size > 0)
             .and_then(|size| size.checked_next_multiple_of(BLOCK_SIZE))
             .and_then(|size| i64::try_from(size).ok())
             .ok_or(ControllerError::ExceedsLimit(wanted, i64::MAX))?;
@@ -383,12 +386,13 @@ mod tests {
 
     #[tokio::test]
     async fn sizes_are_rounded_to_blocks_within_the_limit() {
-        let f = Fixture::new("sizes").await;
+        let mut f = Fixture::new("sizes").await;
         let op = &f.operator;
         assert_eq!(op.resolve_size(0, 0).unwrap(), 4096); // default 1024, rounded
         assert_eq!(op.resolve_size(4096, 0).unwrap(), 4096);
         assert_eq!(op.resolve_size(4097, 0).unwrap(), 8192);
         assert_eq!(op.resolve_size(1, 4096).unwrap(), 4096);
+        assert_eq!(op.resolve_size(0, 5000).unwrap(), 4096);
         // No whole block fits between required and limit.
         assert!(op.resolve_size(4097, 5000).is_err());
         assert!(op.resolve_size(0, 1000).is_err());
@@ -397,6 +401,15 @@ mod tests {
             op.create_volume(&f.id("pvc-1"), 4097, 5000, &f.url).await,
             Err(ControllerError::ExceedsLimit(..))
         ));
+        f.operator.default_size = 16384;
+        assert_eq!(f.operator.resolve_size(0, 5000).unwrap(), 4096);
+        assert_eq!(
+            f.operator
+                .create_volume(&f.id("limited"), 0, 5000, &f.url)
+                .await
+                .unwrap(),
+            4096
+        );
         tokio::fs::remove_dir_all(&f.root).await.unwrap();
     }
 

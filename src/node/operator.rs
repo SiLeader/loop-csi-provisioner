@@ -67,6 +67,11 @@ impl NodeOperator {
         let _guard = self.locks.lock(volume_id).await;
 
         if self.is_mount_point(staging_target_path).await? {
+            self.verify_staged_volume(volume_id, staging_target_path)
+                .await?;
+            if self.syscall.is_readonly(staging_target_path).await? != read_only {
+                return Err(NodeError::WrongMountAt(staging_target_path.to_string()));
+            }
             return Ok(());
         }
         tokio::fs::create_dir_all(staging_target_path).await?;
@@ -122,26 +127,34 @@ impl NodeOperator {
 
     pub async fn publish_volume(
         &self,
+        volume_id: &str,
         staging_target_path: &str,
         target_path: &str,
         readonly: bool,
     ) -> Result<(), NodeError> {
         let _guard = self.locks.lock(target_path).await;
 
-        if !self.is_mount_point(staging_target_path).await? {
-            // Bind mounting an unstaged directory would silently expose an empty directory.
-            return Err(NodeError::NotStagedAt(staging_target_path.to_string()));
-        }
+        self.verify_staged_volume(volume_id, staging_target_path)
+            .await?;
         tokio::fs::create_dir_all(target_path).await?;
 
         let src = MountSource::bind(staging_target_path);
         let remount_readonly = MountOptions::default().remount(true).readonly(true);
         if self.is_mount_point(target_path).await? {
+            if !self
+                .syscall
+                .same_file(staging_target_path, target_path)
+                .await?
+            {
+                return Err(NodeError::WrongMountAt(target_path.to_string()));
+            }
             // A previous attempt may have bound the volume but failed to make it read-only.
             if readonly && !self.syscall.is_readonly(target_path).await? {
                 self.syscall
                     .mount(src, target_path, remount_readonly)
                     .await?;
+            } else if !readonly && self.syscall.is_readonly(target_path).await? {
+                return Err(NodeError::WrongMountAt(target_path.to_string()));
             }
             return Ok(());
         }
@@ -164,6 +177,24 @@ impl NodeOperator {
         Ok(res)
     }
 
+    async fn verify_staged_volume(&self, volume_id: &str, path: &str) -> Result<(), NodeError> {
+        if !self.is_mount_point(path).await? {
+            return Err(NodeError::NotStagedAt(path.to_string()));
+        }
+        let Some(device) = self.syscall.loop_device_of_mount(path).await? else {
+            return Err(NodeError::WrongVolumeAt(path.to_string()));
+        };
+        let image = self.volume_file_path(volume_id).await?;
+        if !self
+            .syscall
+            .loop_device_matches_image(device, image)
+            .await?
+        {
+            return Err(NodeError::WrongVolumeAt(path.to_string()));
+        }
+        Ok(())
+    }
+
     pub async fn unpublish_volume(&self, target_path: &str) -> Result<(), NodeError> {
         let _guard = self.locks.lock(target_path).await;
 
@@ -181,10 +212,11 @@ impl NodeOperator {
     ) -> Result<(), NodeError> {
         let _guard = self.locks.lock(volume_id).await;
 
-        // While staged, the mount itself identifies the loop device, so unstaging does not
-        // depend on the backing storage (e.g. an unreachable NFS server) being available.
+        // Identify the mounted loop device before unmounting, and verify its backing image.
         let mut device = None;
         if self.is_mount_point(staging_target_path).await? {
+            self.verify_staged_volume(volume_id, staging_target_path)
+                .await?;
             device = self
                 .syscall
                 .loop_device_of_mount(staging_target_path)
