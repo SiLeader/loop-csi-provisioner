@@ -165,12 +165,14 @@ jobs:
           SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           # Tolerate a tag left by an earlier attempt of this run, as long as it is the same commit.
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --jq .object.sha 2>/dev/null || true)
-          if [[ -z "$existing" ]]; then
+          # gh api prints the error body (not the --jq result) on 404, so branch on the exit status.
+          if existing=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" --jq .object.sha 2>/dev/null); then
+            if [[ "$existing" != "$SHA" ]]; then
+              echo "::error::Tag v$VERSION already exists at $existing (expected $SHA)."
+              exit 1
+            fi
+          else
             gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/v$VERSION" -f sha="$SHA" --silent
-          elif [[ "$existing" != "$SHA" ]]; then
-            echo "::error::Tag v$VERSION already exists at $existing (expected $SHA)."
-            exit 1
           fi
 
   container:
