@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: driver
-          image: ghcr.io/sileader/loop-csi-provisioner:v0.1.0
+          image: ghcr.io/sileader/loop-csi-provisioner:v0.1.1
           args:
             - --node-api
             - --identity-api
