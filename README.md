@@ -20,8 +20,11 @@ under that directory. The backing directory and both subdirectories must already
 For NFS, the export must be reachable from every host running a controller or node service that uses it. A local
 directory must likewise be available at the same path to each service that needs the volume.
 
-The node implementation uses `mountpoint`, `mount`, `losetup`, `blkid`, `mkfs.ext4`, and `resize2fs`; NFS also needs an
-NFS mount helper. Run the service on Linux with the permissions and loop devices required for these operations.
+The driver supports ext4 filesystem volumes with `SINGLE_NODE_WRITER` or `SINGLE_NODE_READER_ONLY` access. It does not
+support block volumes, other filesystems, mount flags, or volume mount groups. The node runs `mkfs.ext4` when formatting
+a new volume and `resize2fs` when expanding one. Loop-device and mount operations use Linux system calls. Run the node
+service on Linux with access to loop devices and the permissions needed to mount filesystems; NFS backing storage also
+requires the host to support NFS mounts.
 
 ## Build and run
 
@@ -42,12 +45,13 @@ Start the CSI gRPC server, for example:
 With no API selection flags, the process serves the Identity, Controller, and Node APIs. Pass one or more of
 `--identity-api`, `--controller-api`, and `--node-api` to serve only those selected APIs. `--listen` also accepts
 `tcp://127.0.0.1:1234`. `--default-size` sets the fallback volume size in bytes (default: 1 GiB). `--plaintext-log`
-selects text logs instead of JSON logs. See `--help` for all options.
+selects text logs instead of JSON logs. The Node API uses `NODE_ID` as its node identifier, falling back to
+`/etc/hostname`. See `--help` for all options.
 
 ## Kubernetes status
 
-This repository does not yet include a complete Kubernetes deployment. [
-`deploy/manifests`](deploy/manifests/storageclass.yaml) is an example StorageClass; a controller, node DaemonSet, CSI
+This repository does not yet include a complete Kubernetes deployment. [The example StorageClass](deploy/manifests/storageclass.yaml)
+sets the required `url` parameter and `fsType: ext4`; a controller, node DaemonSet, CSI
 sidecars, sockets, and privileges must be configured separately.
 
 The basic create, publish, stage, expand, unpublish, unstage, and delete operations are implemented. Snapshot, listing,

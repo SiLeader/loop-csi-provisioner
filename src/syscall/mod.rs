@@ -9,12 +9,6 @@ pub(crate) use mount::*;
 #[derive(Debug, Default)]
 pub(crate) struct Syscall {}
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum Filesystem {
-    Ext4,
-    Xfs,
-}
-
 impl Syscall {
     async fn spawn<F, R>(f: F) -> Result<R, std::io::Error>
     where

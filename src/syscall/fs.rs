@@ -1,4 +1,5 @@
-use crate::syscall::{Filesystem, Syscall};
+use crate::filesystem::Filesystem;
+use crate::syscall::Syscall;
 use std::io::SeekFrom;
 use std::path::Path;
 use tokio::fs::File;

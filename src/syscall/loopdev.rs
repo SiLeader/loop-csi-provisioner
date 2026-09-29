@@ -1,5 +1,5 @@
 use crate::syscall::Syscall;
-use rustix::fs::{Mode, OFlags, open};
+use rustix::fs::{Mode, OFlags, open, stat};
 use rustix::ioctl::{Getter, NoArg, Setter, ioctl};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -29,6 +29,13 @@ impl Syscall {
         .await
     }
 
+    pub async fn resolve_attached_loop_device(
+        &self,
+        image_path: impl AsRef<Path>,
+    ) -> std::io::Result<Option<PathBuf>> {
+        get_attached_loop_device(image_path).await
+    }
+
     pub async fn detach_loop(&self, loop_device: impl AsRef<Path>) -> std::io::Result<()> {
         let ld = loop_device.as_ref().to_path_buf();
         Self::spawn(move || {
@@ -37,6 +44,46 @@ impl Syscall {
         })
         .await
     }
+}
+
+async fn get_attached_loop_device(
+    image_file: impl AsRef<Path>,
+) -> std::io::Result<Option<PathBuf>> {
+    let dev_fs = Path::new("/dev");
+
+    let image_stat = stat(image_file.as_ref())?;
+
+    let mut dir = tokio::fs::read_dir("/sys/block").await?;
+    while let Some(entry) = dir.next_entry().await? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+
+        if !name.starts_with("loop") {
+            continue;
+        }
+
+        let device_file = dev_fs.join(name);
+        let device = device_file.clone();
+
+        let info = Syscall::spawn(move || {
+            let Ok(ld) = LoopDevice::open(device) else {
+                return Ok(None);
+            };
+            let Ok(info) = ld.get_status() else {
+                return Ok(None);
+            };
+            Ok(Some(info))
+        })
+        .await?;
+        if let Some(info) = info {
+            if info.lo_device == image_stat.st_dev && info.lo_inode == image_stat.st_ino {
+                return Ok(Some(device_file));
+            }
+        }
+    }
+    Ok(None)
 }
 
 struct LoopControl {
@@ -52,10 +99,9 @@ const LOOP_CTL_GET_FREE: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOO
 const LOOP_CONFIGURE: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_CONFIGURE;
 const LOOP_CLR_FD: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_CLR_FD;
 const LOOP_SET_CAPACITY: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_SET_CAPACITY;
+const LOOP_GET_STATUS64: rustix::ioctl::Opcode = linux_raw_sys::loop_device::LOOP_GET_STATUS64;
 
-const LO_FLAGS_READ_ONLY: u32 = linux_raw_sys::loop_device::LO_FLAGS_READ_ONLY as u32;
 const LO_FLAGS_AUTOCLEAR: u32 = linux_raw_sys::loop_device::LO_FLAGS_AUTOCLEAR as u32;
-const LO_FLAGS_PARTSCAN: u32 = linux_raw_sys::loop_device::LO_FLAGS_PARTSCAN as u32;
 
 #[repr(C)]
 struct LoopInfo64 {
@@ -148,6 +194,11 @@ impl LoopDevice {
             ioctl(&self.file, NoArg::<LOOP_SET_CAPACITY>::new())?;
         }
         Ok(())
+    }
+
+    fn get_status(&self) -> std::io::Result<LoopInfo64> {
+        let info = unsafe { ioctl(&self.file, Getter::<LOOP_GET_STATUS64, LoopInfo64>::new())? };
+        Ok(info)
     }
 
     fn into_path(self) -> PathBuf {

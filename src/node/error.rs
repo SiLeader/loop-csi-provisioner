@@ -1,3 +1,4 @@
+use crate::filesystem::FsError;
 use std::process::Output;
 
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +17,9 @@ pub(crate) enum NodeError {
 
     #[error("Only ext4 filesystems are supported")]
     UnsupportedFilesystem,
+
+    #[error(transparent)]
+    Fs(#[from] FsError),
 }
 
 impl From<Output> for NodeError {
@@ -40,6 +44,7 @@ impl From<NodeError> for tonic::Status {
             NodeError::UnsupportedFilesystem => {
                 tonic::Status::failed_precondition("Only ext4 filesystems are supported")
             }
+            NodeError::Fs(e) => tonic::Status::internal(format!("Fs error: {}", e)),
         }
     }
 }

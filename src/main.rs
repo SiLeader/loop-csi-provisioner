@@ -16,6 +16,7 @@ use crate::proto::csi::v1::identity_server::IdentityServer;
 use crate::proto::csi::v1::node_server::NodeServer;
 
 mod controller;
+mod filesystem;
 mod identity;
 mod mount;
 mod node;

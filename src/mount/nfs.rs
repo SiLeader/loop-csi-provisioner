@@ -1,7 +1,6 @@
 use crate::mount::Mounter;
 use crate::mount::error::MountError;
 use crate::syscall::{MountOptions, MountSource, Syscall};
-use tokio::process::Command;
 use tonic::async_trait;
 use tonic::transport::Uri;
 

@@ -1,14 +1,15 @@
+use crate::filesystem::{Filesystem, FilesystemManager};
 use crate::mount::MountManager;
 use crate::node::error::NodeError;
-use crate::syscall::{Filesystem, MountOptions, MountSource, Syscall};
+use crate::syscall::{MountOptions, MountSource, Syscall};
 use crate::volume_id::{VOLUME_DIR, parse_volume_id};
 use std::path::PathBuf;
-use tokio::process::Command;
 
 pub(crate) struct NodeOperator {
     base_directory: String,
     mounter: MountManager,
     syscall: Syscall,
+    fs: FilesystemManager,
 }
 
 impl NodeOperator {
@@ -17,6 +18,7 @@ impl NodeOperator {
             base_directory,
             mounter: MountManager::default(),
             syscall: Syscall::default(),
+            fs: FilesystemManager::default(),
         })
     }
 
@@ -51,16 +53,7 @@ impl NodeOperator {
         let loop_device = self.find_loop_device(volume_id).await?;
 
         let fs = match self.syscall.detect_filesystem(&loop_device).await? {
-            None => {
-                let res = Command::new("mkfs.ext4")
-                    .args(["-F", &loop_device])
-                    .output()
-                    .await?;
-                if !res.status.success() {
-                    return Err(res.into());
-                }
-                Filesystem::Ext4
-            }
+            None => self.fs.create(Filesystem::Ext4, &loop_device).await?,
             Some(fs) => {
                 if fs != Filesystem::Ext4 {
                     return Err(NodeError::UnsupportedFilesystem);
@@ -127,16 +120,8 @@ impl NodeOperator {
             self.syscall.unmount(staging_target_path).await?;
         }
         let path = self.volume_file_path(volume_id).await?;
-        let path = path.to_string_lossy().to_string();
-        let existing = Command::new("losetup").args(["-j", &path]).output().await?;
-        if !existing.status.success() {
-            return Err(existing.into());
-        }
-        if let Some(device) = String::from_utf8_lossy(&existing.stdout)
-            .lines()
-            .next()
-            .and_then(|line| line.split_once(':').map(|(device, _)| device.to_string()))
-        {
+        let device = self.syscall.resolve_attached_loop_device(&path).await?;
+        if let Some(device) = device {
             self.syscall.detach_loop(&device).await?;
         }
         Ok(())
@@ -156,13 +141,7 @@ impl NodeOperator {
             .apply_loop_device_capacity(&loop_device)
             .await?;
 
-        let res = Command::new("resize2fs")
-            .args([&loop_device])
-            .output()
-            .await?;
-        if !res.status.success() {
-            return Err(res.into());
-        }
+        self.fs.resize(Filesystem::Ext4, &loop_device).await?;
 
         let metadata = tokio::fs::metadata(&path).await?;
         Ok(metadata.len() as i64)

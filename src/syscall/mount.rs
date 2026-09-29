@@ -1,4 +1,5 @@
-use crate::syscall::{Filesystem, Syscall};
+use crate::filesystem::Filesystem;
+use crate::syscall::Syscall;
 use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,6 @@ pub(crate) enum MountSource {
     Bind(PathBuf),
     Nfs(PathBuf),
     Fs(FsMountSource),
-    File(FsMountSource),
 }
 
 #[derive(Debug, Clone)]
@@ -38,21 +38,11 @@ impl MountSource {
             path: path.as_ref().to_path_buf(),
         })
     }
-
-    pub fn file(src: FsMountSource) -> Self {
-        Self::File(src)
-    }
 }
 
 impl FsMountSource {
     fn path(&self) -> &Path {
         &self.path
-    }
-
-    fn replaced(&self, path: PathBuf) -> Self {
-        let mut this = self.clone();
-        this.path = path;
-        this
     }
 }
 
@@ -99,11 +89,6 @@ impl Syscall {
             MountSource::Bind(source) => self.mount_bind(source, target, options).await,
             MountSource::Nfs(source) => self.mount_nfs(source, target, options).await,
             MountSource::Fs(source) => self.mount_fs(source, target, options).await,
-            MountSource::File(source) => {
-                let loop_dev = self.find_loop(source.path()).await?;
-                self.mount_fs(source.replaced(loop_dev), target, options)
-                    .await
-            }
         }
     }
 
