@@ -49,8 +49,9 @@ storageClasses: []
 #    annotations: {}
 
 controller:
-  # The driver serializes operations per volume inside one process only, so the Deployment always
-  # runs a single replica.
+  # The driver serializes operations per volume inside one process only, so only the replica
+  # holding the controller Lease serves the Controller API; extra replicas are hot standbys.
+  replicas: 1
   extraArgs: []
   extraEnv: []
   resources: {}

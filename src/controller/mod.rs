@@ -194,8 +194,6 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<ValidateVolumeCapabilitiesRequest>,
     ) -> Result<Response<ValidateVolumeCapabilitiesResponse>, Status> {
-        self.check_leadership().await?;
-
         let request = request.into_inner();
         if request.volume_id.is_empty() {
             return Err(Status::invalid_argument("Missing volume ID"));
@@ -261,8 +259,6 @@ impl Controller for LoopCsiController {
         &self,
         _request: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
-        self.check_leadership().await?;
-
         use controller_service_capability::rpc::Type;
         Ok(Response::new(ControllerGetCapabilitiesResponse {
             capabilities: [

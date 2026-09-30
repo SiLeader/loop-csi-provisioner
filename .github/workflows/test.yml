@@ -72,6 +72,10 @@ jobs:
         shell: bash
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Run Clippy without default features
+        shell: bash
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
   license:
     runs-on: ubuntu-latest
     steps:

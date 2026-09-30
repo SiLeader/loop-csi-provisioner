@@ -1,4 +1,4 @@
-# Run exactly one replica: the driver serializes operations per volume inside one process only.
+# Only the replica holding the controller Lease serves the Controller API; extra replicas are standbys.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,6 +28,15 @@ spec:
             # Placeholder: replace with the storage URL(s) used by your StorageClasses.
             # 127.0.0.1 would be the pod itself, not an NFS server.
             - --allowed-url-prefix=nfs://127.0.0.1/share
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           securityContext:
             # The controller mounts the backing NFS export itself.
             privileged: true
