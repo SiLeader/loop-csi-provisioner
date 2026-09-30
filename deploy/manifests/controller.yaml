@@ -22,7 +22,7 @@ spec:
       serviceAccountName: loop-csi-controller
       containers:
         - name: driver
-          image: ghcr.io/sileader/loop-csi-provisioner:v0.1.2
+          image: ghcr.io/sileader/loop-csi-provisioner:v0.1.3
           args:
             - --controller-api
             - --identity-api
