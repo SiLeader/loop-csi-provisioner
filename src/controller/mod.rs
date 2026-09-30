@@ -1,5 +1,5 @@
 mod error;
-mod mutex;
+pub(crate) mod mutex;
 pub(crate) mod operator;
 
 use crate::capability::supported_capability;
@@ -41,6 +41,16 @@ impl LoopCsiController {
             lease,
         }
     }
+
+    async fn check_leadership(&self) -> Result<(), Status> {
+        if self.lease.is_leader().await {
+            Ok(())
+        } else {
+            Err(Status::unavailable(
+                "This controller instance is not the leader",
+            ))
+        }
+    }
 }
 
 /// Returns `(required_bytes, limit_bytes)`, with 0 meaning unspecified as in CSI.
@@ -63,6 +73,8 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
+        self.check_leadership().await?;
+
         let request = request.into_inner();
         let Some(url) = request.parameters.get("url").cloned() else {
             return Err(Status::invalid_argument("Missing 'url' parameter"));
@@ -107,6 +119,8 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
+        self.check_leadership().await?;
+
         let request = request.into_inner();
         if request.volume_id.is_empty() {
             return Err(Status::invalid_argument("Missing volume ID"));
@@ -128,6 +142,8 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
+        self.check_leadership().await?;
+
         let request = request.into_inner();
         if request.volume_id.is_empty() {
             return Err(Status::invalid_argument("Missing volume ID"));
@@ -161,6 +177,8 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<ControllerUnpublishVolumeRequest>,
     ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
+        self.check_leadership().await?;
+
         let request = request.into_inner();
         let operator = self.operator.clone();
         run_to_completion("ControllerUnpublishVolume", async move {
@@ -176,6 +194,8 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<ValidateVolumeCapabilitiesRequest>,
     ) -> Result<Response<ValidateVolumeCapabilitiesResponse>, Status> {
+        self.check_leadership().await?;
+
         let request = request.into_inner();
         if request.volume_id.is_empty() {
             return Err(Status::invalid_argument("Missing volume ID"));
@@ -241,6 +261,8 @@ impl Controller for LoopCsiController {
         &self,
         _request: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
+        self.check_leadership().await?;
+
         use controller_service_capability::rpc::Type;
         Ok(Response::new(ControllerGetCapabilitiesResponse {
             capabilities: [
@@ -292,6 +314,8 @@ impl Controller for LoopCsiController {
         &self,
         request: Request<ControllerExpandVolumeRequest>,
     ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
+        self.check_leadership().await?;
+
         let request = request.into_inner();
         if request.volume_id.is_empty() {
             return Err(Status::invalid_argument("Missing volume ID"));

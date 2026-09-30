@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::controller::LoopCsiController;
+use crate::controller::mutex::{DEFAULT_NAMESPACE, default_controller_mutex};
 use crate::controller::operator::ControllerOperator;
 use crate::mount::MountManager;
 use crate::node::LoopCsiNode;
@@ -80,6 +81,17 @@ struct Args {
     )]
     node_id: String,
 
+    #[arg(long, env = "NAMESPACE", default_value = DEFAULT_NAMESPACE, help = "Kubernetes namespace for the Lease resource")]
+    namespace: String,
+
+    #[arg(
+        long,
+        env = "POD_NAME",
+        default_value = "",
+        help = "Kubernetes pod name for the Lease resource"
+    )]
+    pod_name: String,
+
     #[arg(long, help = "Use plaintext logging instead of structured logging")]
     plaintext_log: bool,
 }
@@ -121,14 +133,17 @@ async fn main() -> anyhow::Result<()> {
         );
         Some(NodeServer::new(LoopCsiNode::new(
             NodeOperator::new(args.base_directory.clone(), mounter.clone()).await?,
-            args.node_id,
+            args.node_id.clone(),
         )))
     } else {
         None
     };
     let controller = if controller_api {
+        let controller_mutex = default_controller_mutex(args.namespace, args.pod_name).await;
+
         Some(ControllerServer::new(LoopCsiController::new(
             ControllerOperator::new(args.default_size, args.base_directory, mounter).await?,
+            controller_mutex,
         )))
     } else {
         None

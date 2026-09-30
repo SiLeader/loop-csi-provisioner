@@ -1,3 +1,5 @@
+use crate::controller::error::ControllerError;
+use crate::controller::mutex::ControllerMutex;
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
@@ -7,8 +9,9 @@ use kube::api::{Patch, PatchParams};
 use kube::{Api, Client};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
+use tonic::async_trait;
 use tracing::{debug, error, info};
 
 #[derive(Clone)]
@@ -19,7 +22,7 @@ pub(crate) struct KubernetesControllerMutex {
     cancellation_token: CancellationToken,
 }
 
-const DEFAULT_NAMESPACE: &str = "loop-csi";
+pub const DEFAULT_NAMESPACE: &str = "loop-csi";
 const DEFAULT_LEASE_NAME: &str = "controller";
 const DEFAULT_DURATION: Duration = Duration::seconds(10);
 
@@ -31,6 +34,13 @@ pub(crate) struct LeaseMeta {
     lease_name: String,
     identity: String,
     duration: Duration,
+}
+
+#[async_trait]
+impl ControllerMutex for KubernetesControllerMutex {
+    async fn is_leader(&self) -> Result<bool, ControllerError> {
+        Ok(self.is_leader.load(Ordering::SeqCst))
+    }
 }
 
 impl KubernetesControllerMutex {
@@ -48,7 +58,7 @@ impl KubernetesControllerMutex {
         Ok(Self::new(client, meta))
     }
 
-    async fn start(&self) {
+    pub(crate) fn start(&self) {
         let this = self.clone();
         tokio::spawn(this.renew_loop());
     }
@@ -56,12 +66,14 @@ impl KubernetesControllerMutex {
     async fn renew_loop(self) {
         while !self.cancellation_token.is_cancelled() {
             match self.renew_lease().await {
-                Ok(updated) => {
-                    if updated {
+                Ok(is_leader) => {
+                    if is_leader {
                         info!("Lease holder is got");
                     } else {
                         debug!("Not lease holder");
                     }
+                    self.is_leader
+                        .store(is_leader, std::sync::atomic::Ordering::SeqCst);
                 }
                 Err(e) => {
                     error!("Failed to renew lease: {}", e);
@@ -103,18 +115,8 @@ impl LeaseMeta {
         }
     }
 
-    pub fn with_namespace(mut self, namespace: &str) -> Self {
-        self.namespace = namespace.to_string();
-        self
-    }
-
-    pub fn with_lease_name(mut self, lease_name: &str) -> Self {
-        self.lease_name = lease_name.to_string();
-        self
-    }
-
-    pub fn with_duration(mut self, duration: Duration) -> Self {
-        self.duration = duration;
+    pub fn with_namespace(mut self, namespace: String) -> Self {
+        self.namespace = namespace;
         self
     }
 
