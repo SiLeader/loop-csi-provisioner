@@ -1,24 +1,50 @@
 use crate::controller::error::ControllerError;
-use crate::lock::KeyedLocks;
+use crate::lock::{FileLock, KeyedLocks};
 use crate::mount::MountManager;
 use crate::volume_id::{METADATA_DIR, VOLUME_DIR, parse_volume_id};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OwnedMutexGuard;
 
 pub(crate) struct ControllerOperator {
     default_size: i64,
     base_directory: String,
     mounter: Arc<MountManager>,
-    /// Serializes operations per volume ID. It does not coordinate several controller
-    /// processes sharing one backing directory; run a single active controller.
+    /// Serializes operations per volume ID inside this process; [`Self::lock_volume`] adds a
+    /// file lock on the backing storage for other processes.
     locks: KeyedLocks,
 }
 
 /// Volume sizes are rounded up to whole ext4 blocks, so the loop device and the filesystem
 /// cover the entire image and the reported capacity is what the volume can actually hold.
 const BLOCK_SIZE: u64 = 4096;
+
+/// Volumes share a fixed set of lock files in the metadata directory. Deleting a volume's own
+/// lock file would be unsafe: a process still holding the unlinked file and one that created
+/// a new file at the same path could both believe they hold the lock.
+const LOCK_FILES: u64 = 64;
+
+/// How long to wait for another controller process to finish with a volume before
+/// returning ABORTED, which the CO retries.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Holds a volume exclusively against both this process and other controller processes.
+struct VolumeGuard {
+    _file: FileLock,
+    _local: OwnedMutexGuard<()>,
+}
+
+/// Returns the lock file index for a volume name. FNV-1a keeps it stable across builds and
+/// hosts, which `DefaultHasher` does not promise.
+fn lock_file_index(name: &str) -> u64 {
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    hash % LOCK_FILES
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -103,6 +129,25 @@ impl ControllerOperator {
         Ok(metadata_base_directory.join(format!("{}.json", volume_id)))
     }
 
+    async fn lock_volume(&self, volume_id: &str) -> Result<VolumeGuard, ControllerError> {
+        let Some((url, name)) = parse_volume_id(volume_id) else {
+            return Err(ControllerError::VolumeIdParse);
+        };
+        let local = self.locks.lock(volume_id).await;
+
+        let mount_point = self.mounter.mount(url, &self.base_directory).await?;
+        let path = PathBuf::from(&mount_point)
+            .join(METADATA_DIR)
+            .join(format!("lock-{:02x}.lock", lock_file_index(name)));
+        let Some(file) = FileLock::acquire(path, LOCK_TIMEOUT).await? else {
+            return Err(ControllerError::Busy(volume_id.to_string()));
+        };
+        Ok(VolumeGuard {
+            _file: file,
+            _local: local,
+        })
+    }
+
     async fn load_metadata(&self, volume_id: &str) -> Result<Option<Metadata>, ControllerError> {
         let metadata_file_path = self.metadata_file_path(volume_id).await?;
         match tokio::fs::read(&metadata_file_path).await {
@@ -132,7 +177,7 @@ impl ControllerOperator {
             return Err(ControllerError::VolumeIdParse);
         }
         let size = self.resolve_size(required, limit)?;
-        let _guard = self.locks.lock(volume_id).await;
+        let _guard = self.lock_volume(volume_id).await?;
 
         let path = self.volume_file_path(volume_id).await?;
         if tokio::fs::try_exists(&path).await? {
@@ -169,7 +214,7 @@ impl ControllerOperator {
     }
 
     pub async fn delete_volume(&self, volume_id: &str) -> Result<(), ControllerError> {
-        let _guard = self.locks.lock(volume_id).await;
+        let _guard = self.lock_volume(volume_id).await?;
 
         let metadata = self.load_metadata(volume_id).await?;
         if let Some(metadata) = metadata
@@ -198,7 +243,7 @@ impl ControllerOperator {
         volume_id: &str,
         node_id: &str,
     ) -> Result<(), ControllerError> {
-        let _guard = self.locks.lock(volume_id).await;
+        let _guard = self.lock_volume(volume_id).await?;
 
         if !tokio::fs::try_exists(self.volume_file_path(volume_id).await?).await? {
             return Err(ControllerError::NotFound(volume_id.to_string()));
@@ -227,7 +272,7 @@ impl ControllerOperator {
         volume_id: &str,
         node_id: &str,
     ) -> Result<(), ControllerError> {
-        let _guard = self.locks.lock(volume_id).await;
+        let _guard = self.lock_volume(volume_id).await?;
 
         if let Some(mut metadata) = self.load_metadata(volume_id).await?
             && (node_id.is_empty() || metadata.attached_node.as_deref() == Some(node_id))
@@ -257,7 +302,7 @@ impl ControllerOperator {
         required: i64,
         limit: i64,
     ) -> Result<i64, ControllerError> {
-        let _guard = self.locks.lock(volume_id).await;
+        let _guard = self.lock_volume(volume_id).await?;
 
         let path = self.volume_file_path(volume_id).await?;
         if !tokio::fs::try_exists(&path).await? {
@@ -463,9 +508,55 @@ mod tests {
         let mut names = Vec::new();
         let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
         while let Some(entry) = entries.next_entry().await.unwrap() {
-            names.push(entry.file_name().to_string_lossy().to_string());
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".lock") {
+                names.push(name);
+            }
         }
         assert_eq!(names, ["pvc-1.json"]);
         tokio::fs::remove_dir_all(&f.root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn controllers_sharing_storage_attach_to_one_node_only() {
+        let f = Fixture::new("shared").await;
+        let id = f.id("pvc-1");
+        f.operator.create_volume(&id, 0, 0, &f.url).await.unwrap();
+        // A second controller process with its own mounts of the same storage.
+        let other = ControllerOperator::new(
+            1024,
+            f.root.join("other-mounts").to_string_lossy().to_string(),
+            Arc::new(MountManager::default()),
+        )
+        .await
+        .unwrap();
+        let operators = [Arc::new(f.operator), Arc::new(other)];
+
+        let tasks: Vec<_> = (0..16)
+            .map(|i| {
+                let operator = operators[i % 2].clone();
+                let id = id.clone();
+                tokio::spawn(
+                    async move { operator.publish_volume(&id, &format!("node-{i}")).await },
+                )
+            })
+            .collect();
+        let mut succeeded = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(()) => succeeded += 1,
+                Err(ControllerError::AlreadyAttached { .. }) => {}
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(succeeded, 1);
+        tokio::fs::remove_dir_all(&f.root).await.unwrap();
+    }
+
+    #[test]
+    fn lock_file_index_is_stable() {
+        // Controllers of different builds must agree on the lock file for a volume.
+        assert_eq!(lock_file_index("pvc-1"), 42);
+        assert!((0..100).all(|i| lock_file_index(&format!("pvc-{i}")) < LOCK_FILES));
     }
 }

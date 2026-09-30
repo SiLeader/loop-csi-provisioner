@@ -10,7 +10,6 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::controller::LoopCsiController;
-use crate::controller::mutex::default_controller_mutex;
 use crate::controller::operator::ControllerOperator;
 use crate::mount::MountManager;
 use crate::node::LoopCsiNode;
@@ -81,21 +80,6 @@ struct Args {
     )]
     node_id: String,
 
-    #[arg(
-        long,
-        env = "NAMESPACE",
-        help = "Kubernetes namespace for the Lease resource (default: the namespace of this pod)"
-    )]
-    namespace: Option<String>,
-
-    #[arg(
-        long,
-        env = "POD_NAME",
-        default_value = "",
-        help = "Unique name of this controller instance, used as the Lease holder identity"
-    )]
-    pod_name: String,
-
     #[arg(long, help = "Use plaintext logging instead of structured logging")]
     plaintext_log: bool,
 }
@@ -137,20 +121,14 @@ async fn main() -> anyhow::Result<()> {
         );
         Some(NodeServer::new(LoopCsiNode::new(
             NodeOperator::new(args.base_directory.clone(), mounter.clone()).await?,
-            args.node_id.clone(),
+            args.node_id,
         )))
     } else {
         None
     };
-    let controller_lease = if controller_api {
-        Some(default_controller_mutex(args.namespace, args.pod_name).await?)
-    } else {
-        None
-    };
-    let controller = if let Some(lease) = controller_lease.clone() {
+    let controller = if controller_api {
         Some(ControllerServer::new(LoopCsiController::new(
             ControllerOperator::new(args.default_size, args.base_directory, mounter).await?,
-            lease,
         )))
     } else {
         None
@@ -202,11 +180,6 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     } else {
         anyhow::bail!("--listen must start with unix:// or tcp://");
-    }
-
-    // Let a standby take over immediately instead of waiting for the lease to expire.
-    if let Some(lease) = controller_lease {
-        lease.release().await;
     }
 
     Ok(())

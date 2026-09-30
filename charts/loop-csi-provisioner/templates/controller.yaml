@@ -1,6 +1,6 @@
 {{- $sidecars := .Values.sidecars }}
 {{- with .Values.controller }}
-# Only the replica holding the controller Lease serves the Controller API; the others stand by.
+# With several replicas, each sidecar's leader election picks the replica that serves it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -11,8 +11,12 @@ metadata:
     app.kubernetes.io/component: controller
 spec:
   replicas: {{ .replicas }}
+  # Start the new pod before stopping the old one; the sidecars' leases hand over the work.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       {{- include "loop-csi-provisioner.selectorLabels" (dict "context" $ "component" "controller") | nindent 6 }}
@@ -52,14 +56,6 @@ spec:
             {{- end }}
           env:
             {{- include "loop-csi-provisioner.driverEnv" $ | nindent 12 }}
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
             {{- with .extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

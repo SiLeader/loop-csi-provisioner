@@ -27,6 +27,9 @@ pub(crate) enum ControllerError {
         attached_node: String,
     },
 
+    #[error("Another operation on volume {0} is in progress")]
+    Busy(String),
+
     #[error("Failed to parse volume ID")]
     VolumeIdParse,
 
@@ -70,6 +73,10 @@ impl From<ControllerError> for tonic::Status {
             } => tonic::Status::failed_precondition(format!(
                 "Volume {} is still attached to node {}",
                 volume_id, attached_node
+            )),
+            ControllerError::Busy(volume_id) => tonic::Status::aborted(format!(
+                "Another operation on volume {} is in progress",
+                volume_id
             )),
             ControllerError::VolumeIdParse => {
                 tonic::Status::invalid_argument("Failed to parse volume ID")

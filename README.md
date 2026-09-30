@@ -15,14 +15,17 @@ The StorageClass `url` parameter selects the backing directory:
 | `file:///srv/loop-csi`                  | A local directory visible to the process |
 | `nfs://nfs.example.com/export/loop-csi` | An NFS export mounted by the process     |
 
-The driver uses `volumes/<volume-name>.img` for image files and `metadata/<volume-name>.json` for attachment metadata
-under that directory. The backing directory and both subdirectories must already exist and be writable by the driver.
-For NFS, the export must be reachable from every host running a controller or node service that uses it. A local
-directory must likewise be available at the same path to each service that needs the volume.
+The driver uses `volumes/<volume-name>.img` for image files, `metadata/<volume-name>.json` for attachment metadata,
+and `metadata/lock-<nn>.lock` for controller locks under that directory. The backing directory and both
+subdirectories must already exist and be writable by the driver. For NFS, the export must be reachable from every host
+running a controller or node service that uses it. A local directory must likewise be available at the same path to each
+service that needs the volume.
 
 Image files are sparse, so the backing storage is not reserved up front and can run out of space while a volume is in
-use. The controller keeps a per-volume lock but does not coordinate several controller processes that share one backing
-directory; run a single active controller.
+use. The controller serializes operations per volume with an exclusive `flock` on a lock file in the backing directory,
+so several controller replicas can share it: on NFS the server arbitrates the lock between hosts. An operation that
+waits more than 30 seconds for another controller returns `ABORTED` and is retried by the CO. NFS locks last as long as
+the client's lease: a controller cut off from the server for longer than that (90 seconds by default) loses its lock.
 
 New volumes are formatted with ext4 multi-mount protection (`mmp`): while one host has a volume mounted, the kernel
 refuses to mount it on another, e.g. after Kubernetes force-detaches a volume from a node that stopped responding but is
@@ -75,7 +78,9 @@ CO uses for the node (in Kubernetes, the node name). See `--help` for all option
 [an example StorageClass](deploy/manifests/storageclass.yaml) that sets the required `url` parameter and `fsType: ext4`.
 Apply the driver with `kubectl apply -k deploy/manifests`, then adapt and apply the StorageClass. The manifests are
 exercised on kind (see below) but not yet on a production cluster; review the image tag, the `--allowed-url-prefix`
-value, and the privileges before use.
+value, and the privileges before use. The controller Deployment runs one replica; raise `replicas` in
+[controller.yaml](deploy/manifests/controller.yaml) (or `controller.replicas` in the Helm chart) for standby
+controllers, which need storage that every controller pod reaches, such as NFS.
 
 The same deployment is available as the Helm chart [charts/loop-csi-provisioner](charts/loop-csi-provisioner), which
 releases also push to `oci://ghcr.io/sileader/charts/loop-csi-provisioner`. `allowedUrlPrefixes` is required, and
