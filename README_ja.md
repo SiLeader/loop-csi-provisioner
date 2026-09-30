@@ -2,100 +2,44 @@
 
 [English](README.md)
 
-`loop-csi-provisioner` は開発途中の Linux 向け CSI ドライバーです。ローカルディレクトリまたは NFS
-エクスポート内に作成したイメージファイルを使い、ファイルシステムボリュームを提供することを目指しています。Controller
-がイメージファイルを作成・拡張し、Node がそのファイルをループデバイスに接続して、必要に応じて ext4 で初期化した後、CSI
-のステージング先と公開先にマウントします。
+ローカルディレクトリまたは NFS エクスポート上のイメージファイルを使って、ファイルシステムボリュームを提供する Linux 向け CSI ドライバーです。
 
-## ストレージの配置
+> [!WARNING]
+> 開発途中のプロジェクトです。Kubernetes マニフェストは kind 上で検証していますが、本番クラスターではまだ試していません。
 
-StorageClass の `url` パラメーターで保存先のディレクトリを指定します。
+## 仕組み
 
-| URL                                     | 保存先                                  |
-|-----------------------------------------|-----------------------------------------|
-| `file:///srv/loop-csi`                  | プロセスから見えるローカルディレクトリ  |
-| `nfs://nfs.example.com/export/loop-csi` | プロセスがマウントする NFS エクスポート |
+1. **Controller** が保存先にスパースなイメージファイルを作成し、拡張時にはサイズを変更します。
+2. **Node** がイメージファイルをループデバイスに接続し、新規ボリュームであれば ext4 で初期化して、CSI のステージング先と公開先にマウントします。
 
-指定したディレクトリの下に、イメージファイルを `volumes/<ボリューム名>.img`、接続情報を `metadata/<ボリューム名>.json`
-として保存し、Controller のロックには `metadata/lock-<nn>.lock.d/` を使います。
-保存先と二つのサブディレクトリは、事前に作成し、ドライバーが書き込めるようにしてください。NFS
-を使う場合は、そのボリュームを扱う Controller と Node
-の各ホストからエクスポートに接続できる必要があります。ローカルディレクトリも、ボリュームを扱う各サービスから同じパスで参照できる必要があります。
+## 機能と制限
 
-イメージファイルはスパースファイルなので、保存先の容量は事前に確保されず、ボリュームの使用中に容量不足になることがあります。Controller
-は保存先にロックディレクトリをアトミックに作成することで、複数レプリカ間の操作を直列化します。NFS のネットワーク分断中もロックの所有権は
-失効しないため、NFS のリースを失った Controller が再開して、新しい所有者と同時に動作することを防ぎます。ローカル mutex の待機、
-マウント、保存先のロック取得には、合計 30 秒の期限を設けています。期限を超えると `ABORTED` を返し、CO に再試行を促します。
-実行中のロック用システムコールとクリーンアップは、呼び出し元のタイムアウト後もブロックしているシステムコールを含め、プロセスごとに最大 64 件に制限します。
+**対応しているもの**
 
-Controller がクラッシュした場合、操作が中断された場合、またはロックの削除に失敗した場合は、ロックディレクトリが残り、
-同じロックバケットの操作は `ABORTED` を返します。復旧は手動で行います。そのロックを所有している可能性がある、または取得中の
-すべての Controller を停止してフェンシングし、保留中の NFS 操作が後から再開しないことを確認してください。その後、保存先の空の
-ロックディレクトリを `rmdir` で削除し、Controller を再起動します。到達できないノードの Pod を削除するだけでは、フェンシングにはなりません。
-ロックの古さやヘルスチェックの失敗を理由に削除しないでください。プロセス内のロックだけ、またはファイルロックを使う以前の Controller は、
-このバージョンを起動する前に停止してください。これらは、このバージョンのディレクトリロックとは協調できません。
+- ext4 ファイルシステムボリューム
+- アクセスモード `SINGLE_NODE_WRITER` と `SINGLE_NODE_READER_ONLY`
+- 作成、公開、ステージング、拡張（オンライン）、公開解除、ステージング解除、削除
+- NFS などの共有ストレージを使った複数レプリカの Controller（アクティブ／スタンバイ）
+- 同じボリュームを二つのホストでマウントすることを防ぐ ext4 Multi-Mount Protection
 
-新しいボリュームは ext4 の Multi-Mount Protection（`mmp`）付きで初期化します。あるホストがボリュームをマウントしている間は、
-別のホストでのマウントをカーネルが拒否します（応答しなくなったがまだ動いているノードから Kubernetes が強制 detach した場合など）。
-正常にアンマウントされたボリュームはすぐにマウントできますが、そうでない場合（ほかで使用中、またはノードがクラッシュした場合）は、
-マウント前に MMP の間隔数回分（通常は数十秒）待ちます。以前のバージョンで初期化したボリュームは、アンマウントした状態のイメージに
-`tune2fs -O mmp` を実行するまでこの保護を受けません。ボリュームのサイズは 4 KiB 単位に切り上げます。
+**対応していないもの**
 
-保存先 URL はボリューム ID に含まれるため、ボリュームは作成時の URL に結び付きます。NFS サーバーのアドレスが変わっても、既存の
-PersistentVolume はそれに追従できません。NFS エクスポートは `mount.nfs` の既定のオプションでマウントします。クエリ文字列付きの URL
-は拒否するため、`nfsvers` などのオプションはまだ指定できません。
+- ブロックボリューム、ext4 以外のファイルシステム、マウントフラグ、ボリュームマウントグループ
+- スナップショット、一覧、ヘルスチェックなどのオプションの CSI RPC（`UNIMPLEMENTED` を返します）
+- `nfsvers` などの NFS マウントオプション（クエリ文字列付きの URL は拒否します）
 
-対応するのは ext4 ファイルシステムボリュームと `SINGLE_NODE_WRITER` / `SINGLE_NODE_READER_ONLY` アクセスモードです。
-ブロックボリューム、ほかのファイルシステム、マウントフラグ、ボリュームマウントグループには対応していません。Node は新規ボリュームの
-初期化時に `mkfs.ext4`、拡張時に `resize2fs` を実行します。初期化するのは先頭 1 MiB がすべて 0 のデバイスだけで、それ以外で ext4
-と認識できないものは初期化せずに拒否します。ループデバイスとローカルのマウントには Linux のシステムコールを使い、NFS は `mount`
-コマンドでマウントするため、`mount.nfs`（`nfs-common`）が必要です（同梱の Dockerfile でインストールしています）。
-Node サービスは、ループデバイスへのアクセスとマウントに必要な権限を備えた Linux 環境で実行してください。NFS を保存先に使う場合は、
-ホスト側で NFS マウントも利用できる必要があります。
+## 必要なもの
 
-## ビルドと起動
+- **ビルド:** Rust/Cargo と `protoc`
+- **Node サービス:** ループデバイスを使え、ファイルシステムのマウントに必要な権限を持つ Linux 環境
+- **NFS を保存先に使う場合:** `mount.nfs`（`nfs-common`。同梱の Dockerfile でインストール済み）と、ホスト側の NFS マウント対応
 
-Rust/Cargo と `protoc` を用意してビルドします。
+## Kubernetes へのデプロイ
 
-```sh
-cargo build --release
-```
+### Helm
 
-CSI gRPC サーバーの起動例です。
-
-```sh
-./target/release/loop-csi-provisioner \
-  --listen unix:///csi/csi.sock \
-  --base-directory /var/lib/loop-csi-provisioner
-```
-
-API 選択フラグを省略すると、Identity、Controller、Node の各 API を提供します。`--identity-api`、`--controller-api`、
-`--node-api` を一つ以上指定すると、指定した API だけを提供します。`--listen` には `tcp://127.0.0.1:1234` も指定できます。
-`--default-size` はサイズ指定のないボリュームの容量をバイト単位で設定します（既定値は 1 GiB）。`--plaintext-log` を指定すると
-JSON 形式ではなくテキスト形式でログを出力します。ログレベルは `RUST_LOG` で指定します（既定は `info`）。
-`--allowed-url-prefix`（複数指定可）は、マウントを許可する保存先 URL を `/` 区切りの前方一致で制限します。例:
-`--allowed-url-prefix nfs://nfs.example.com/export`。URL はすべてのボリューム ID に含まれるため、本番では必ず指定してください。指定しないと、
-PersistentVolume や StorageClass を作成できる人が、任意の URL をドライバーにマウントさせられます。gRPC API には認証も TLS もないため、
-`tcp://` ではなく Unix ソケットを使ってください。Node API には `--node-id`（または `NODE_ID`）が必要で、CO がそのノードに
-使う名前（Kubernetes ではノード名）と一致させてください。全オプションは `--help` で確認できます。
-
-## Kubernetes 対応状況
-
-[deploy/manifests](deploy/manifests) に、CSIDriver、RBAC、Controller の Deployment、Node の DaemonSet、
-[StorageClass の例](deploy/manifests/storageclass.yaml)（必須の `url` パラメーターと `fsType: ext4` を指定）を置いています。
-ドライバーは `kubectl apply -k deploy/manifests` で適用し、StorageClass は環境に合わせて編集してから適用してください。マニフェストは kind
-上では検証していますが（後述）、本番クラスターではまだ試していません。使用前に、イメージのタグ、`--allowed-url-prefix` の値、権限を確認してください。
-Controller の Deployment は 1 レプリカで動作します。待機用の Controller を追加する場合は、
-[controller.yaml](deploy/manifests/controller.yaml) の `replicas`（Helm チャートでは `controller.replicas`）を増やしてください。
-その場合は、NFS など、すべての Controller Pod からアクセスできる保存先が必要です。実行中の操作がクラッシュした後のフェイルオーバーには、
-前述のロック復旧が必要です。マニフェストと Helm チャートはどちらも `Recreate` 方式で更新し、複数レプリカを設定している場合も、
-古い Controller Pod をすべて停止してから新しいバージョンを起動します。更新中は Controller の操作が一時的に利用できなくなりますが、
-マウント済みのボリュームは引き続き使えます。以前のロック実装から更新する場合も、この更新方式を維持してください。古い Controller のノードに
-到達できない場合は、新しいバージョンを起動する前に、そのノードと保留中のストレージ操作をフェンシングしてください。
-
-同じ構成を Helm チャート [charts/loop-csi-provisioner](charts/loop-csi-provisioner) としても提供しています。リリース時には
-`oci://ghcr.io/sileader/charts/loop-csi-provisioner` にも push されます。`allowedUrlPrefixes` は必須で、`storageClasses`
-を指定すると StorageClass も作成します。
+Helm チャートは [charts/loop-csi-provisioner](charts/loop-csi-provisioner) にあり、
+`oci://ghcr.io/sileader/charts/loop-csi-provisioner` でも公開しています。
 
 ```sh
 helm install loop-csi-provisioner oci://ghcr.io/sileader/charts/loop-csi-provisioner \
@@ -105,21 +49,185 @@ helm install loop-csi-provisioner oci://ghcr.io/sileader/charts/loop-csi-provisi
   --set 'storageClasses[0].url=nfs://nfs.example.com/export/loop-csi'
 ```
 
-`file://` の保存先を使う場合は、`controller.extraVolumes`、`controller.extraVolumeMounts`、`node.extraVolumes`、
-`node.extraVolumeMounts` でそのディレクトリを Controller と Node の両方の Pod にマウントしてください。kubelet のルートが
-`/var/lib/kubelet` でないディストリビューションでは `kubeletDir` を設定してください。すべての設定項目は
-[values.yaml](charts/loop-csi-provisioner/values.yaml) を参照してください。
+| 値                                                        | 説明                                                               |
+|-----------------------------------------------------------|--------------------------------------------------------------------|
+| `allowedUrlPrefixes`                                      | **必須。** ドライバーがマウントしてよい保存先 URL                  |
+| `storageClasses`                                          | 作成する StorageClass（任意）                                      |
+| `controller.replicas`                                     | Controller のレプリカ数（[高可用性](#高可用性)を参照）             |
+| `controller.extraVolumes`, `controller.extraVolumeMounts` | Controller Pod に追加するボリューム（`file://` の保存先用など）    |
+| `node.extraVolumes`, `node.extraVolumeMounts`             | Node Pod に追加するボリューム（`file://` の保存先用など）          |
+| `kubeletDir`                                              | kubelet のルート（`/var/lib/kubelet` でない場合）                  |
 
-基本的な作成、公開、ステージング、拡張、公開解除、ステージング解除、削除を実装しました。スナップショット、一覧、ヘルスチェックなどのオプションの
-CSI RPC は `UNIMPLEMENTED` を返します。Node でのマウントには、ループデバイスを備えた特権付き Linux
-ホストが必要です。
+`file://` の保存先を使う場合は、そのディレクトリを Controller と Node の**両方**の Pod にマウントしてください。
+すべての設定項目は [values.yaml](charts/loop-csi-provisioner/values.yaml) を参照してください。
 
-単体テスト（`cargo test`）は Controller のローカルファイルのライフサイクルを対象とし、特権は不要です。E2E テスト
-[test/e2e/run.sh](test/e2e/run.sh) はイメージをビルドし、kind ノード上の `file://` 保存先を使って [kind](https://kind.sigs.k8s.io/)
-クラスターにマニフェストを適用します（`DEPLOY=helm` を指定すると代わりに Helm チャートをインストールします）。そのうえで PVC の作成、書き込み、オンライン拡張、読み取り専用での再マウント、Multi-Mount Protection、
-削除までを確認します。Docker、kind、kubectl と、ループデバイスを使えるホストカーネルが必要です。`KEEP_CLUSTER=1` を指定すると、
-デバッグ用にクラスターを残します。`BACKEND=nfs` を指定すると、クラスター内の NFS サーバー Pod が提供する NFS エクスポートを
-保存先として同じ確認を行います（ホストカーネルに `nfs` と `nfsd` モジュールが必要です）。
+### マニフェスト
+
+[deploy/manifests](deploy/manifests) に、CSIDriver、RBAC、Controller の Deployment、Node の DaemonSet、
+[StorageClass の例](deploy/manifests/storageclass.yaml) があります。
+
+```sh
+kubectl apply -k deploy/manifests
+```
+
+その後、StorageClass を環境に合わせて編集して適用してください。`url` パラメーターと `fsType: ext4` の指定が必要です。
+使用前に、イメージのタグ、`--allowed-url-prefix` の値、権限を確認してください。
+
+## 保存先
+
+StorageClass の `url` パラメーターで保存先のディレクトリを指定します。
+
+| URL                                     | 保存先                                  |
+|-----------------------------------------|-----------------------------------------|
+| `file:///srv/loop-csi`                  | プロセスから見えるローカルディレクトリ  |
+| `nfs://nfs.example.com/export/loop-csi` | プロセスがマウントする NFS エクスポート |
+
+ディレクトリの構成は次のとおりです。
+
+```text
+<保存先ディレクトリ>/
+├── volumes/
+│   └── <ボリューム名>.img       # イメージファイル
+└── metadata/
+    ├── <ボリューム名>.json      # 接続情報
+    └── lock-<nn>.lock.d/        # Controller のロック
+```
+
+使用前の準備:
+
+- 保存先ディレクトリ、`volumes/`、`metadata/` を作成し、ドライバーが書き込めるようにしてください。
+- 保存先を使う Controller と Node の各ホストから保存先にアクセスできるようにしてください。ローカルディレクトリの場合は、
+  各ホストで同じパスから参照できる必要があります。
+
+注意点:
+
+- **イメージファイルはスパースファイルです。** 容量は事前に確保されないため、ボリュームの使用中に保存先が容量不足になることがあります。
+- **サイズは 4 KiB 単位に切り上げます。**
+- **保存先 URL はボリューム ID に含まれます。** ボリュームは作成時の URL に結び付くため、NFS サーバーのアドレスが変わっても、
+  既存の PersistentVolume は追従できません。
+- NFS エクスポートは `mount.nfs` の既定のオプションでマウントします。
+
+## コマンドラインでの使い方
+
+ビルド:
+
+```sh
+cargo build --release
+```
+
+起動:
+
+```sh
+./target/release/loop-csi-provisioner \
+  --listen unix:///csi/csi.sock \
+  --base-directory /var/lib/loop-csi-provisioner
+```
+
+| オプション                                          | 既定値                          | 説明 |
+|-----------------------------------------------------|---------------------------------|------|
+| `--listen`                                          | `unix:///csi/csi.sock`          | gRPC の待ち受けアドレス。`tcp://127.0.0.1:1234` も指定可能 |
+| `--base-directory`                                  | `/var/lib/loop-csi-provisioner` | 保存先をマウントするディレクトリ |
+| `--identity-api`, `--controller-api`, `--node-api`  | （全 API）                      | 指定した API だけを提供。どれも指定しなければ三つすべてを提供 |
+| `--node-id` / `NODE_ID`                             |                                 | **Node API では必須。** CO がそのノードに使う名前（Kubernetes ではノード名）と一致させる |
+| `--allowed-url-prefix`（複数指定可）                | （任意の URL）                  | 許可する保存先 URL。`/` 区切りの前方一致。例: `nfs://nfs.example.com/export` |
+| `--default-size`                                    | `1073741824`（1 GiB）           | サイズ指定のないボリュームの容量（バイト） |
+| `--plaintext-log`                                   | JSON 形式                       | ログを JSON ではなくテキスト形式で出力 |
+| `RUST_LOG`                                          | `info`                          | ログレベル |
+
+全オプションは `--help` で確認できます。
+
+> [!IMPORTANT]
+> **セキュリティ**
+>
+> - **本番では必ず `--allowed-url-prefix` を指定してください。** 指定しないと、PersistentVolume や StorageClass
+>   を作成できる人が、任意の URL をドライバーにマウントさせられます。
+> - gRPC API には認証も TLS もありません。`tcp://` ではなく Unix ソケットを使ってください。
+
+## 運用
+
+### Multi-Mount Protection
+
+新しいボリュームは ext4 の Multi-Mount Protection（`mmp`）付きで初期化します。あるホストがボリュームをマウントしている間は、
+別のホストでのマウントをカーネルが拒否します。これにより、応答しなくなったがまだ動いているノードから Kubernetes
+がボリュームを強制 detach した場合などでも、二重マウントを防ぎます。
+
+- 正常にアンマウントされたボリュームはすぐにマウントできます。
+- そうでない場合（ほかで使用中、またはノードがクラッシュした場合）は、マウント前に MMP の間隔数回分（通常は数十秒）待ちます。
+- 以前のバージョンで初期化したボリュームは、アンマウントした状態のイメージに `tune2fs -O mmp` を実行するまで保護されません。
+
+Node が初期化するのは先頭 1 MiB がすべて 0 のデバイスだけです。それ以外で ext4 と認識できないものは、初期化せずに拒否します。
+
+### Controller のロック
+
+Controller は、保存先にロックディレクトリをアトミックに作成することで、複数レプリカ間も含めて操作を直列化します。
+
+- NFS のネットワーク分断中もロックの所有権は失効しません。そのため、NFS のリースを失った Controller が再開して、
+  新しい所有者と同時に動作することはありません。
+- ローカル mutex の待機、マウント、保存先のロック取得には、合計 **30 秒の期限**があります。期限を超えると `ABORTED` を返し、
+  CO が再試行します。
+- 同時に実行するロック用システムコールとクリーンアップは、プロセスごとに最大 64 件です。呼び出し元のタイムアウト後も
+  ブロックしているシステムコールもこれに含まれます。
+
+### 残ったロックの復旧
+
+Controller がクラッシュした場合、操作が中断された場合、またはロックの削除に失敗した場合は、ロックディレクトリが残ります。
+その後、同じロックバケットの操作は `ABORTED` を返し続けます。復旧は意図的に手動にしています。
+
+1. そのロックを所有している可能性がある、または取得中のすべての Controller を停止してフェンシングします。
+2. 保留中の NFS 操作が後から再開しないことを確認します。
+3. 保存先の空のロックディレクトリを `rmdir` で削除します。
+4. Controller を再起動します。
+
+> [!CAUTION]
+> - 到達できないノードの Pod を削除するだけでは、フェンシングに**なりません**。
+> - ロックの古さやヘルスチェックの失敗を理由にロックを削除しないでください。
+
+### 高可用性
+
+Controller の Deployment は既定で 1 レプリカです。待機用の Controller を追加する場合は、
+[controller.yaml](deploy/manifests/controller.yaml) の `replicas`（Helm チャートでは `controller.replicas`）を増やしてください。
+
+- すべての Controller Pod から、NFS など同じ保存先にアクセスできる必要があります。
+- 実行中の操作がクラッシュした後のフェイルオーバーには、[残ったロックの復旧](#残ったロックの復旧)が必要です。
+
+### 更新
+
+マニフェストと Helm チャートはどちらも `Recreate` 方式で更新します。複数レプリカの場合も、古い Controller Pod
+をすべて停止してから新しいバージョンを起動します。
+
+- 更新中は Controller の操作を利用できません。マウント済みのボリュームは引き続き使えます。
+- 以前のロック実装から更新する場合も、この更新方式を維持してください。プロセス内のロックだけ、またはファイルロックを使う
+  以前の Controller は、ディレクトリロックと協調できないため、先に停止する必要があります。
+- 古い Controller のノードに到達できない場合は、新しいバージョンを起動する前に、そのノードと保留中のストレージ操作を
+  フェンシングしてください。
+
+## テスト
+
+### 単体テスト
+
+```sh
+cargo test
+```
+
+Controller のローカルファイルのライフサイクルを対象とし、特権は不要です。
+
+### E2E テスト
+
+```sh
+test/e2e/run.sh
+```
+
+[test/e2e/run.sh](test/e2e/run.sh) はイメージをビルドして [kind](https://kind.sigs.k8s.io/) クラスターにドライバーをデプロイし、
+PVC の作成、書き込み、オンライン拡張、読み取り専用での再マウント、Multi-Mount Protection、削除までを確認します。
+
+| 環境変数         | 効果                                                                                          |
+|------------------|-----------------------------------------------------------------------------------------------|
+| `DEPLOY=helm`    | マニフェストの代わりに Helm チャートをインストール                                            |
+| `BACKEND=nfs`    | kind ノード上の `file://` ディレクトリの代わりに、クラスター内の NFS サーバー Pod の NFS エクスポートを保存先に使用 |
+| `KEEP_CLUSTER=1` | デバッグ用にクラスターを残す                                                                  |
+
+Docker、kind、kubectl と、ループデバイスを使えるホストカーネルが必要です。`BACKEND=nfs` ではさらに `nfs` と `nfsd`
+カーネルモジュールが必要です。
 
 ## ライセンス
 
