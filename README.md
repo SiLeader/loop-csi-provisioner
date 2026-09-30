@@ -32,8 +32,8 @@ If a controller crashes or its operation is interrupted, or lock removal fails, 
 operations in that lock bucket return `ABORTED`. Recovery is deliberately manual: stop and fence every controller that could own or be
 acquiring that lock, ensure its pending NFS operations cannot later resume, then remove the empty lock directory with
 `rmdir` on the backing storage and restart the controllers. Pod deletion alone on an unreachable node is not fencing.
-Do not remove locks based on age or a failed health check. Controllers using the previous file-lock implementation
-must be stopped before starting this version; the two locking protocols cannot coordinate with each other.
+Do not remove locks based on age or a failed health check. Earlier controllers using only in-process locks or file
+locks must be stopped before starting this version; they cannot coordinate with its directory locks.
 
 New volumes are formatted with ext4 multi-mount protection (`mmp`): while one host has a volume mounted, the kernel
 refuses to mount it on another, e.g. after Kubernetes force-detaches a volume from a node that stopped responding but is
@@ -89,7 +89,11 @@ exercised on kind (see below) but not yet on a production cluster; review the im
 value, and the privileges before use. The controller Deployment runs one replica; raise `replicas` in
 [controller.yaml](deploy/manifests/controller.yaml) (or `controller.replicas` in the Helm chart) for standby
 controllers, which need storage that every controller pod reaches, such as NFS. Failover after an in-flight
-operation crashes requires the lock recovery described above.
+operation crashes requires the lock recovery described above. Both the manifests and the Helm chart use `Recreate`
+updates to stop all old controller pods before starting the new version, including when several replicas are configured.
+Controller operations are temporarily unavailable during an update; already mounted volumes remain usable. Keep this
+strategy when upgrading from an earlier locking implementation. If an old controller's node is unreachable, fence it
+and its pending storage operations before starting the new version.
 
 The same deployment is available as the Helm chart [charts/loop-csi-provisioner](charts/loop-csi-provisioner), which
 releases also push to `oci://ghcr.io/sileader/charts/loop-csi-provisioner`. `allowedUrlPrefixes` is required, and

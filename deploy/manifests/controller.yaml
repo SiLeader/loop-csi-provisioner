@@ -8,12 +8,9 @@ metadata:
   namespace: loop-csi
 spec:
   replicas: 1
-  # Start the new pod before stopping the old one; the sidecars' leases hand over the work.
+  # Stop all old pods first: earlier drivers do not share this version's storage locks.
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+    type: Recreate
   selector:
     matchLabels:
       app: loop-csi-controller
