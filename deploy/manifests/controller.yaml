@@ -1,6 +1,6 @@
 # Raise `replicas` for standby controllers: each sidecar's leader election picks the replica that
-# serves it, and the driver serializes operations per volume across pods with a file lock on the
-# backing storage.
+# serves it, and the driver serializes operations across pods with directory locks on backing storage.
+# After an interrupted operation, fence the old holder before manual lock recovery (see README).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

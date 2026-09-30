@@ -1,14 +1,11 @@
-use rustix::fs::FlockOperation;
-use rustix::io::Errno;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-/// Upper bound for the pause between attempts to take a busy [`FileLock`].
+/// Upper bound for the pause between attempts to take a busy [`StorageLock`].
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Serializes operations that target the same key (e.g. a volume ID or a path).
@@ -29,29 +26,94 @@ impl KeyedLocks {
     }
 }
 
-/// An exclusive `flock(2)` on a file, released when dropped.
-///
-/// On NFS the kernel implements `flock` with byte-range locks held by the server, so the lock
-/// also excludes processes on other hosts that mount the same export.
+/// Limits blocked NFS syscalls, including late acquisitions and lock removal. A permit stays
+/// with the blocking operation even after its caller times out, so retries cannot exhaust
+/// Tokio's blocking pool. Holders also retain their permit until removal finishes.
+static STORAGE_LOCK_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(64)));
+
+/// An atomic mkdir lock. Unlike an NFS advisory lock, ownership does not expire when a
+/// client's lease expires. A crashed holder leaves the directory behind: it must only be
+/// removed after that holder has been fenced (including any pending NFS operations).
 #[derive(Debug)]
-pub(crate) struct FileLock {
-    _file: File,
+pub(crate) struct StorageLock {
+    path: Option<PathBuf>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
-impl FileLock {
-    /// Locks `path`, creating the file if needed. Returns `None` if someone else still holds
-    /// the lock after `timeout`.
+/// An acquisition not yet handed to a volume operation is always safe to clean up on
+/// cancellation, including when the result is buffered in the oneshot channel.
+struct PendingLock(Option<StorageLock>);
+
+impl Drop for PendingLock {
+    fn drop(&mut self) {
+        if let Some(lock) = self.0.take() {
+            lock.release();
+        }
+    }
+}
+
+impl StorageLock {
+    /// Returns None when acquisition cannot complete before the deadline. A late successful
+    /// mkdir is cleaned up without running the caller's volume operation.
     pub async fn acquire(path: PathBuf, timeout: Duration) -> std::io::Result<Option<Self>> {
+        Self::acquire_with(path, timeout, STORAGE_LOCK_SLOTS.clone(), |path| {
+            std::fs::create_dir(path)
+        })
+        .await
+    }
+
+    async fn acquire_with<F>(
+        path: PathBuf,
+        timeout: Duration,
+        slots: Arc<Semaphore>,
+        mkdir: F,
+    ) -> std::io::Result<Option<Self>>
+    where
+        F: Fn(&Path) -> std::io::Result<()> + Send + Sync + 'static,
+    {
         let deadline = Instant::now() + timeout;
+        let mkdir = Arc::new(mkdir);
         let mut delay = Duration::from_millis(20);
         loop {
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let permit =
+                match tokio::time::timeout_at(deadline, slots.clone().acquire_owned()).await {
+                    Ok(permit) => permit.map_err(std::io::Error::other)?,
+                    Err(_) => return Ok(None),
+                };
             let attempt = path.clone();
-            // Locking goes to the NFS server, so keep it off the async worker threads.
-            let file = tokio::task::spawn_blocking(move || try_lock(&attempt))
-                .await
-                .map_err(std::io::Error::other)??;
-            if let Some(file) = file {
-                return Ok(Some(Self { _file: file }));
+            let mkdir = mkdir.clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                let result = match mkdir(&attempt) {
+                    Ok(()) => Ok(Some(PendingLock(Some(Self {
+                        path: Some(attempt),
+                        permit: Some(permit),
+                    })))),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+                    Err(e) => Err(e),
+                };
+                // The timed-out/cancelled caller cannot start a volume operation. A late
+                // successful acquisition can therefore be released safely here.
+                let _ = sender.send(result);
+            });
+            let lock = match tokio::time::timeout_at(deadline, receiver).await {
+                Ok(result) => result
+                    .map_err(std::io::Error::other)??
+                    .map(|mut pending| pending.0.take().unwrap()),
+                Err(_) => return Ok(None),
+            };
+            if Instant::now() >= deadline {
+                if let Some(lock) = lock {
+                    lock.release();
+                }
+                return Ok(None);
+            }
+            if lock.is_some() {
+                return Ok(lock);
             }
             let now = Instant::now();
             if now >= deadline {
@@ -61,20 +123,24 @@ impl FileLock {
             delay = (delay * 2).min(MAX_RETRY_DELAY);
         }
     }
-}
 
-fn try_lock(path: &Path) -> std::io::Result<Option<File>> {
-    // NFS emulates exclusive `flock` with write locks, which need a writable descriptor.
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
-        Err(Errno::WOULDBLOCK) => Ok(None),
-        Err(e) => Err(e.into()),
+    /// Release only after the protected operation has returned. Dropping an operation during
+    /// shutdown or a panic must leave its lock intact: its filesystem syscall may still run.
+    pub fn release(mut self) {
+        let Some(path) = self.path.take() else { return };
+        let permit = self.permit.take();
+        // Never block an async worker on NFS. If no runtime remains, leave the lock behind
+        // rather than releasing it while a caller might still be changing storage.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let _permit = permit;
+                if let Err(error) = std::fs::remove_dir(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(path = %path.display(), %error, "storage lock removal failed; fence its holder before manual removal");
+                }
+            });
+        }
     }
 }
 
@@ -106,26 +172,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_lock_excludes_other_holders_until_dropped() {
-        let path = std::env::temp_dir().join(format!("loop-csi-file-lock-{}", std::process::id()));
-        let held = FileLock::acquire(path.clone(), Duration::ZERO)
+    async fn storage_lock_excludes_other_holders_until_released() {
+        let path =
+            std::env::temp_dir().join(format!("loop-csi-storage-lock-{}", std::process::id()));
+        let held = StorageLock::acquire(path.clone(), Duration::from_secs(1))
             .await
             .unwrap()
             .unwrap();
-        // Each acquisition opens its own descriptor, as another process would.
+        // Another process must also create the same directory exclusively.
         assert!(
-            FileLock::acquire(path.clone(), Duration::from_millis(50))
+            StorageLock::acquire(path.clone(), Duration::from_millis(50))
                 .await
                 .unwrap()
                 .is_none()
         );
+        held.release();
+        StorageLock::acquire(path.clone(), Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap()
+            .release();
+        // Explicit release runs cleanup on the blocking pool.
+        wait_for_removal(&path).await;
+    }
+
+    async fn wait_for_removal(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_directory_never_expires() {
+        let path = std::env::temp_dir().join(format!("loop-csi-abandoned-{}", std::process::id()));
+        let held = StorageLock::acquire(path.clone(), Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap();
+        // Cancellation/panic drops the guard without proving that pending writes finished.
         drop(held);
         assert!(
-            FileLock::acquire(path.clone(), Duration::ZERO)
+            StorageLock::acquire(path.clone(), Duration::from_millis(50))
                 .await
                 .unwrap()
-                .is_some()
+                .is_none()
         );
-        std::fs::remove_file(path).unwrap();
+        assert!(path.is_dir());
+        // Represents manual removal after fencing a crashed holder.
+        std::fs::remove_dir(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn timed_out_syscall_keeps_its_slot_and_cleans_up_late_success() {
+        let path = std::env::temp_dir().join(format!("loop-csi-late-lock-{}", std::process::id()));
+        let slots = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let started = Mutex::new(Some(started_tx));
+        let resume = Mutex::new(resume_rx);
+        let task = tokio::spawn(StorageLock::acquire_with(
+            path.clone(),
+            Duration::from_millis(100),
+            slots.clone(),
+            move |path| {
+                started.lock().unwrap().take().unwrap().send(()).unwrap();
+                resume.lock().unwrap().recv().unwrap();
+                std::fs::create_dir(path)
+            },
+        ));
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(slots.available_permits(), 0);
+        // A retry cannot schedule another filesystem syscall until the old one finishes.
+        assert!(
+            StorageLock::acquire_with(
+                path.clone(),
+                Duration::from_millis(20),
+                slots.clone(),
+                |_| { panic!("a blocked acquisition must retain its slot") }
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        resume_tx.send(()).unwrap();
+        // Cleanup must complete before the permit is returned.
+        let _permit = tokio::time::timeout(Duration::from_secs(2), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
     }
 }

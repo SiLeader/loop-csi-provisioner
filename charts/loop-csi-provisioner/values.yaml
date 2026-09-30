@@ -51,7 +51,8 @@ storageClasses: []
 controller:
   # Each sidecar (provisioner, attacher, resizer) elects its own leader, so with more than one
   # replica their leaders may run in different pods. The driver serializes operations per volume
-  # across pods with a file lock on the backing storage.
+  # across pods with a directory lock on the backing storage. Interrupted operations may leave
+  # locks requiring manual recovery after fencing their holder (see README).
   replicas: 1
   extraArgs: []
   extraEnv: []

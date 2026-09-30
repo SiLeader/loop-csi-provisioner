@@ -1,5 +1,5 @@
 use crate::controller::error::ControllerError;
-use crate::lock::{FileLock, KeyedLocks};
+use crate::lock::{KeyedLocks, StorageLock};
 use crate::mount::MountManager;
 use crate::volume_id::{METADATA_DIR, VOLUME_DIR, parse_volume_id};
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ pub(crate) struct ControllerOperator {
     base_directory: String,
     mounter: Arc<MountManager>,
     /// Serializes operations per volume ID inside this process; [`Self::lock_volume`] adds a
-    /// file lock on the backing storage for other processes.
+    /// directory lock on the backing storage for other processes.
     locks: KeyedLocks,
 }
 
@@ -22,10 +22,9 @@ pub(crate) struct ControllerOperator {
 /// cover the entire image and the reported capacity is what the volume can actually hold.
 const BLOCK_SIZE: u64 = 4096;
 
-/// Volumes share a fixed set of lock files in the metadata directory. Deleting a volume's own
-/// lock file would be unsafe: a process still holding the unlinked file and one that created
-/// a new file at the same path could both believe they hold the lock.
-const LOCK_FILES: u64 = 64;
+/// Volumes share a fixed set of directory lock paths. Directories are created exclusively
+/// and removed only when an operation finishes; they never expire after a network partition.
+const LOCK_BUCKETS: u64 = 64;
 
 /// How long to wait for another controller process to finish with a volume before
 /// returning ABORTED, which the CO retries.
@@ -33,17 +32,17 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Holds a volume exclusively against both this process and other controller processes.
 struct VolumeGuard {
-    _file: FileLock,
+    _storage: StorageLock,
     _local: OwnedMutexGuard<()>,
 }
 
-/// Returns the lock file index for a volume name. FNV-1a keeps it stable across builds and
+/// Returns the lock bucket index for a volume name. FNV-1a keeps it stable across builds and
 /// hosts, which `DefaultHasher` does not promise.
-fn lock_file_index(name: &str) -> u64 {
+fn lock_bucket_index(name: &str) -> u64 {
     let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     });
-    hash % LOCK_FILES
+    hash % LOCK_BUCKETS
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,17 +132,28 @@ impl ControllerOperator {
         let Some((url, name)) = parse_volume_id(volume_id) else {
             return Err(ControllerError::VolumeIdParse);
         };
-        let local = self.locks.lock(volume_id).await;
+        let deadline = tokio::time::Instant::now() + LOCK_TIMEOUT;
+        let local = tokio::time::timeout_at(deadline, self.locks.lock(volume_id))
+            .await
+            .map_err(|_| ControllerError::Busy(volume_id.to_string()))?;
 
-        let mount_point = self.mounter.mount(url, &self.base_directory).await?;
+        let mount_point =
+            tokio::time::timeout_at(deadline, self.mounter.mount(url, &self.base_directory))
+                .await
+                .map_err(|_| ControllerError::Busy(volume_id.to_string()))??;
         let path = PathBuf::from(&mount_point)
             .join(METADATA_DIR)
-            .join(format!("lock-{:02x}.lock", lock_file_index(name)));
-        let Some(file) = FileLock::acquire(path, LOCK_TIMEOUT).await? else {
+            .join(format!("lock-{:02x}.lock.d", lock_bucket_index(name)));
+        let Some(file) = StorageLock::acquire(
+            path,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await?
+        else {
             return Err(ControllerError::Busy(volume_id.to_string()));
         };
         Ok(VolumeGuard {
-            _file: file,
+            _storage: file,
             _local: local,
         })
     }
@@ -177,65 +187,73 @@ impl ControllerOperator {
             return Err(ControllerError::VolumeIdParse);
         }
         let size = self.resolve_size(required, limit)?;
-        let _guard = self.lock_volume(volume_id).await?;
-
-        let path = self.volume_file_path(volume_id).await?;
-        if tokio::fs::try_exists(&path).await? {
-            let existing = tokio::fs::metadata(&path).await?.len() as i64;
-            if existing < size || (limit > 0 && existing > limit) {
-                return Err(ControllerError::ExistingSize(existing, size));
-            }
-            return Ok(existing);
-        }
-
-        // Size the file under a temporary name and rename it, so a crash in between never
-        // leaves a zero-length image that later CreateVolume calls would reject forever.
-        let mut tmp_name = path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp = PathBuf::from(tmp_name);
+        let guard = self.lock_volume(volume_id).await?;
         let result = async {
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)
-                .await?;
-            file.set_len(size as u64).await?;
-            file.sync_all().await?;
-            drop(file);
-            tokio::fs::rename(&tmp, &path).await
+            let path = self.volume_file_path(volume_id).await?;
+            if tokio::fs::try_exists(&path).await? {
+                let existing = tokio::fs::metadata(&path).await?.len() as i64;
+                if existing < size || (limit > 0 && existing > limit) {
+                    return Err(ControllerError::ExistingSize(existing, size));
+                }
+                return Ok(existing);
+            }
+
+            // Size the file under a temporary name and rename it, so a crash in between never
+            // leaves a zero-length image that later CreateVolume calls would reject forever.
+            let mut tmp_name = path.as_os_str().to_owned();
+            tmp_name.push(".tmp");
+            let tmp = PathBuf::from(tmp_name);
+            let result = async {
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&tmp)
+                    .await?;
+                file.set_len(size as u64).await?;
+                file.sync_all().await?;
+                drop(file);
+                tokio::fs::rename(&tmp, &path).await
+            }
+            .await;
+            if let Err(e) = result {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(e.into());
+            }
+            Ok(size)
         }
         .await;
-        if let Err(e) = result {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e.into());
-        }
-        Ok(size)
+        guard._storage.release();
+        result
     }
 
     pub async fn delete_volume(&self, volume_id: &str) -> Result<(), ControllerError> {
-        let _guard = self.lock_volume(volume_id).await?;
+        let guard = self.lock_volume(volume_id).await?;
+        let result = async {
+            let metadata = self.load_metadata(volume_id).await?;
+            if let Some(metadata) = metadata
+                && let Some(attached_node) = metadata.attached_node
+            {
+                return Err(ControllerError::StillAttached {
+                    volume_id: volume_id.to_string(),
+                    attached_node,
+                });
+            }
+            let path = self.volume_file_path(volume_id).await?;
+            if tokio::fs::try_exists(&path).await? {
+                tokio::fs::remove_file(path).await?;
+            }
 
-        let metadata = self.load_metadata(volume_id).await?;
-        if let Some(metadata) = metadata
-            && let Some(attached_node) = metadata.attached_node
-        {
-            return Err(ControllerError::StillAttached {
-                volume_id: volume_id.to_string(),
-                attached_node,
-            });
-        }
-        let path = self.volume_file_path(volume_id).await?;
-        if tokio::fs::try_exists(&path).await? {
-            tokio::fs::remove_file(path).await?;
-        }
+            let metadata_file_path = self.metadata_file_path(volume_id).await?;
+            if tokio::fs::try_exists(&metadata_file_path).await? {
+                tokio::fs::remove_file(metadata_file_path).await?;
+            }
 
-        let metadata_file_path = self.metadata_file_path(volume_id).await?;
-        if tokio::fs::try_exists(&metadata_file_path).await? {
-            tokio::fs::remove_file(metadata_file_path).await?;
+            Ok(())
         }
-
-        Ok(())
+        .await;
+        guard._storage.release();
+        result
     }
 
     pub async fn publish_volume(
@@ -243,28 +261,32 @@ impl ControllerOperator {
         volume_id: &str,
         node_id: &str,
     ) -> Result<(), ControllerError> {
-        let _guard = self.lock_volume(volume_id).await?;
-
-        if !tokio::fs::try_exists(self.volume_file_path(volume_id).await?).await? {
-            return Err(ControllerError::NotFound(volume_id.to_string()));
-        }
-        if let Some(metadata) = self.load_metadata(volume_id).await?
-            && let Some(attached_node) = &metadata.attached_node
-        {
-            if attached_node != node_id {
-                return Err(ControllerError::AlreadyAttached {
-                    volume_id: volume_id.to_string(),
-                    attached_node: attached_node.clone(),
-                    requested_node: node_id.to_string(),
-                });
+        let guard = self.lock_volume(volume_id).await?;
+        let result = async {
+            if !tokio::fs::try_exists(self.volume_file_path(volume_id).await?).await? {
+                return Err(ControllerError::NotFound(volume_id.to_string()));
             }
-            return Ok(());
+            if let Some(metadata) = self.load_metadata(volume_id).await?
+                && let Some(attached_node) = &metadata.attached_node
+            {
+                if attached_node != node_id {
+                    return Err(ControllerError::AlreadyAttached {
+                        volume_id: volume_id.to_string(),
+                        attached_node: attached_node.clone(),
+                        requested_node: node_id.to_string(),
+                    });
+                }
+                return Ok(());
+            }
+            self.save_metadata(&Metadata {
+                volume_id: volume_id.to_string(),
+                attached_node: Some(node_id.to_string()),
+            })
+            .await
         }
-        self.save_metadata(&Metadata {
-            volume_id: volume_id.to_string(),
-            attached_node: Some(node_id.to_string()),
-        })
-        .await
+        .await;
+        guard._storage.release();
+        result
     }
 
     pub async fn unpublish_volume(
@@ -272,15 +294,19 @@ impl ControllerOperator {
         volume_id: &str,
         node_id: &str,
     ) -> Result<(), ControllerError> {
-        let _guard = self.lock_volume(volume_id).await?;
-
-        if let Some(mut metadata) = self.load_metadata(volume_id).await?
-            && (node_id.is_empty() || metadata.attached_node.as_deref() == Some(node_id))
-        {
-            metadata.attached_node = None;
-            self.save_metadata(&metadata).await?;
+        let guard = self.lock_volume(volume_id).await?;
+        let result = async {
+            if let Some(mut metadata) = self.load_metadata(volume_id).await?
+                && (node_id.is_empty() || metadata.attached_node.as_deref() == Some(node_id))
+            {
+                metadata.attached_node = None;
+                self.save_metadata(&metadata).await?;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        guard._storage.release();
+        result
     }
 
     pub async fn volume_size(&self, volume_id: &str) -> Result<i64, ControllerError> {
@@ -302,27 +328,31 @@ impl ControllerOperator {
         required: i64,
         limit: i64,
     ) -> Result<i64, ControllerError> {
-        let _guard = self.lock_volume(volume_id).await?;
-
-        let path = self.volume_file_path(volume_id).await?;
-        if !tokio::fs::try_exists(&path).await? {
-            return Err(ControllerError::NotFound(volume_id.to_string()));
-        }
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .await?;
-        let current = file.metadata().await?.len() as i64;
-        if required <= current {
-            if limit > 0 && current > limit {
-                return Err(ControllerError::ExceedsLimit(current, limit));
+        let guard = self.lock_volume(volume_id).await?;
+        let result = async {
+            let path = self.volume_file_path(volume_id).await?;
+            if !tokio::fs::try_exists(&path).await? {
+                return Err(ControllerError::NotFound(volume_id.to_string()));
             }
-            return Ok(current);
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .await?;
+            let current = file.metadata().await?.len() as i64;
+            if required <= current {
+                if limit > 0 && current > limit {
+                    return Err(ControllerError::ExceedsLimit(current, limit));
+                }
+                return Ok(current);
+            }
+            let size = self.resolve_size(required, limit)?;
+            file.set_len(size as u64).await?;
+            file.sync_all().await?;
+            Ok(size)
         }
-        let size = self.resolve_size(required, limit)?;
-        file.set_len(size as u64).await?;
-        file.sync_all().await?;
-        Ok(size)
+        .await;
+        guard._storage.release();
+        result
     }
 }
 
@@ -509,7 +539,7 @@ mod tests {
         let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
         while let Some(entry) = entries.next_entry().await.unwrap() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".lock") {
+            if !name.ends_with(".lock.d") {
                 names.push(name);
             }
         }
@@ -554,9 +584,9 @@ mod tests {
     }
 
     #[test]
-    fn lock_file_index_is_stable() {
-        // Controllers of different builds must agree on the lock file for a volume.
-        assert_eq!(lock_file_index("pvc-1"), 42);
-        assert!((0..100).all(|i| lock_file_index(&format!("pvc-{i}")) < LOCK_FILES));
+    fn lock_bucket_index_is_stable() {
+        // Controllers of different builds must agree on the lock bucket for a volume.
+        assert_eq!(lock_bucket_index("pvc-1"), 42);
+        assert!((0..100).all(|i| lock_bucket_index(&format!("pvc-{i}")) < LOCK_BUCKETS));
     }
 }

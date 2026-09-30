@@ -16,16 +16,24 @@ The StorageClass `url` parameter selects the backing directory:
 | `nfs://nfs.example.com/export/loop-csi` | An NFS export mounted by the process     |
 
 The driver uses `volumes/<volume-name>.img` for image files, `metadata/<volume-name>.json` for attachment metadata,
-and `metadata/lock-<nn>.lock` for controller locks under that directory. The backing directory and both
+and `metadata/lock-<nn>.lock.d/` for controller locks under that directory. The backing directory and both
 subdirectories must already exist and be writable by the driver. For NFS, the export must be reachable from every host
 running a controller or node service that uses it. A local directory must likewise be available at the same path to each
 service that needs the volume.
 
 Image files are sparse, so the backing storage is not reserved up front and can run out of space while a volume is in
-use. The controller serializes operations per volume with an exclusive `flock` on a lock file in the backing directory,
-so several controller replicas can share it: on NFS the server arbitrates the lock between hosts. An operation that
-waits more than 30 seconds for another controller returns `ABORTED` and is retried by the CO. NFS locks last as long as
-the client's lease: a controller cut off from the server for longer than that (90 seconds by default) loses its lock.
+use. The controller serializes operations across replicas by atomically creating a lock directory in the backing
+storage. Lock ownership never expires during an NFS network partition, so a paused controller cannot resume alongside
+a new owner after losing an NFS lease. Waiting for the local mutex, mounting, and acquiring the storage lock shares a
+30-second deadline; expiration returns `ABORTED` for the CO to retry. Outstanding lock syscalls and cleanup are bounded
+to 64 per process, including syscalls that remain blocked after their caller times out.
+
+If a controller crashes or its operation is interrupted, or lock removal fails, the lock directory remains and
+operations in that lock bucket return `ABORTED`. Recovery is deliberately manual: stop and fence every controller that could own or be
+acquiring that lock, ensure its pending NFS operations cannot later resume, then remove the empty lock directory with
+`rmdir` on the backing storage and restart the controllers. Pod deletion alone on an unreachable node is not fencing.
+Do not remove locks based on age or a failed health check. Controllers using the previous file-lock implementation
+must be stopped before starting this version; the two locking protocols cannot coordinate with each other.
 
 New volumes are formatted with ext4 multi-mount protection (`mmp`): while one host has a volume mounted, the kernel
 refuses to mount it on another, e.g. after Kubernetes force-detaches a volume from a node that stopped responding but is
@@ -80,7 +88,8 @@ Apply the driver with `kubectl apply -k deploy/manifests`, then adapt and apply 
 exercised on kind (see below) but not yet on a production cluster; review the image tag, the `--allowed-url-prefix`
 value, and the privileges before use. The controller Deployment runs one replica; raise `replicas` in
 [controller.yaml](deploy/manifests/controller.yaml) (or `controller.replicas` in the Helm chart) for standby
-controllers, which need storage that every controller pod reaches, such as NFS.
+controllers, which need storage that every controller pod reaches, such as NFS. Failover after an in-flight
+operation crashes requires the lock recovery described above.
 
 The same deployment is available as the Helm chart [charts/loop-csi-provisioner](charts/loop-csi-provisioner), which
 releases also push to `oci://ghcr.io/sileader/charts/loop-csi-provisioner`. `allowedUrlPrefixes` is required, and
