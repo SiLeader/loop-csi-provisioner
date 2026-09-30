@@ -1,4 +1,6 @@
-# Run exactly one replica: the driver serializes operations per volume inside one process only.
+# Raise `replicas` for standby controllers: each sidecar's leader election picks the replica that
+# serves it, and the driver serializes operations across pods with directory locks on backing storage.
+# After an interrupted operation, fence the old holder before manual lock recovery (see README).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +8,7 @@ metadata:
   namespace: loop-csi
 spec:
   replicas: 1
+  # Stop all old pods first: earlier drivers do not share this version's storage locks.
   strategy:
     type: Recreate
   selector:

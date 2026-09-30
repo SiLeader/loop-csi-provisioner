@@ -1,6 +1,6 @@
 {{- $sidecars := .Values.sidecars }}
 {{- with .Values.controller }}
-# Run exactly one replica: the driver serializes operations per volume inside one process only.
+# With several replicas, each sidecar's leader election picks the replica that serves it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,7 +10,8 @@ metadata:
     {{- include "loop-csi-provisioner.labels" $ | nindent 4 }}
     app.kubernetes.io/component: controller
 spec:
-  replicas: 1
+  replicas: {{ .replicas }}
+  # Stop all old pods first: earlier drivers do not share this version's storage locks.
   strategy:
     type: Recreate
   selector:

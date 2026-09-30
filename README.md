@@ -15,14 +15,25 @@ The StorageClass `url` parameter selects the backing directory:
 | `file:///srv/loop-csi`                  | A local directory visible to the process |
 | `nfs://nfs.example.com/export/loop-csi` | An NFS export mounted by the process     |
 
-The driver uses `volumes/<volume-name>.img` for image files and `metadata/<volume-name>.json` for attachment metadata
-under that directory. The backing directory and both subdirectories must already exist and be writable by the driver.
-For NFS, the export must be reachable from every host running a controller or node service that uses it. A local
-directory must likewise be available at the same path to each service that needs the volume.
+The driver uses `volumes/<volume-name>.img` for image files, `metadata/<volume-name>.json` for attachment metadata,
+and `metadata/lock-<nn>.lock.d/` for controller locks under that directory. The backing directory and both
+subdirectories must already exist and be writable by the driver. For NFS, the export must be reachable from every host
+running a controller or node service that uses it. A local directory must likewise be available at the same path to each
+service that needs the volume.
 
 Image files are sparse, so the backing storage is not reserved up front and can run out of space while a volume is in
-use. The controller keeps a per-volume lock but does not coordinate several controller processes that share one backing
-directory; run a single active controller.
+use. The controller serializes operations across replicas by atomically creating a lock directory in the backing
+storage. Lock ownership never expires during an NFS network partition, so a paused controller cannot resume alongside
+a new owner after losing an NFS lease. Waiting for the local mutex, mounting, and acquiring the storage lock shares a
+30-second deadline; expiration returns `ABORTED` for the CO to retry. Outstanding lock syscalls and cleanup are bounded
+to 64 per process, including syscalls that remain blocked after their caller times out.
+
+If a controller crashes or its operation is interrupted, or lock removal fails, the lock directory remains and
+operations in that lock bucket return `ABORTED`. Recovery is deliberately manual: stop and fence every controller that could own or be
+acquiring that lock, ensure its pending NFS operations cannot later resume, then remove the empty lock directory with
+`rmdir` on the backing storage and restart the controllers. Pod deletion alone on an unreachable node is not fencing.
+Do not remove locks based on age or a failed health check. Earlier controllers using only in-process locks or file
+locks must be stopped before starting this version; they cannot coordinate with its directory locks.
 
 New volumes are formatted with ext4 multi-mount protection (`mmp`): while one host has a volume mounted, the kernel
 refuses to mount it on another, e.g. after Kubernetes force-detaches a volume from a node that stopped responding but is
@@ -75,7 +86,14 @@ CO uses for the node (in Kubernetes, the node name). See `--help` for all option
 [an example StorageClass](deploy/manifests/storageclass.yaml) that sets the required `url` parameter and `fsType: ext4`.
 Apply the driver with `kubectl apply -k deploy/manifests`, then adapt and apply the StorageClass. The manifests are
 exercised on kind (see below) but not yet on a production cluster; review the image tag, the `--allowed-url-prefix`
-value, and the privileges before use.
+value, and the privileges before use. The controller Deployment runs one replica; raise `replicas` in
+[controller.yaml](deploy/manifests/controller.yaml) (or `controller.replicas` in the Helm chart) for standby
+controllers, which need storage that every controller pod reaches, such as NFS. Failover after an in-flight
+operation crashes requires the lock recovery described above. Both the manifests and the Helm chart use `Recreate`
+updates to stop all old controller pods before starting the new version, including when several replicas are configured.
+Controller operations are temporarily unavailable during an update; already mounted volumes remain usable. Keep this
+strategy when upgrading from an earlier locking implementation. If an old controller's node is unreachable, fence it
+and its pending storage operations before starting the new version.
 
 The same deployment is available as the Helm chart [charts/loop-csi-provisioner](charts/loop-csi-provisioner), which
 releases also push to `oci://ghcr.io/sileader/charts/loop-csi-provisioner`. `allowedUrlPrefixes` is required, and
